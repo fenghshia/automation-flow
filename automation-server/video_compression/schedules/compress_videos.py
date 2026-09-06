@@ -7,7 +7,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app import app, db, scheduler
 from env import EnvConfig
 from ..models import CompressionMission, CompressionStatus
-from ..service import CompressionService
+from ..service import CompressionError, CompressionService
 
 
 SUPPORTED_SUFFIXES = {".mp4"}
@@ -99,13 +99,18 @@ def refresh_missions(source_directory):
     db.session.commit()
 
 
-def claim_next_mission():
+def claim_next_mission(service):
     candidate = (
         CompressionMission.query.filter_by(status=CompressionStatus.READY)
         .order_by(CompressionMission.id)
         .first()
     )
     if candidate is None:
+        return None
+    try:
+        destination = service.destination_for(candidate.file_name)
+    except (OSError, RuntimeError, ValueError) as error:
+        fail_mission(candidate, error)
         return None
     claimed = (
         db.session.query(CompressionMission)
@@ -117,6 +122,7 @@ def claim_next_mission():
             {
                 CompressionMission.status: CompressionStatus.PROCESSING,
                 CompressionMission.attempts: CompressionMission.attempts + 1,
+                CompressionMission.output_path: str(destination),
                 CompressionMission.error_message: None,
             },
             synchronize_session=False,
@@ -126,7 +132,52 @@ def claim_next_mission():
     return db.session.get(CompressionMission, candidate.id) if claimed == 1 else None
 
 
-def finish_cleanup_pending():
+def mission_paths(mission, service, source_directory):
+    source_directory = Path(source_directory).resolve()
+    source = Path(mission.source_path).resolve()
+    if source.parent != source_directory or source.name != mission.file_name:
+        raise CompressionError("Mission source path does not match its configured directory")
+
+    expected_output = service.destination_for(mission.file_name)
+    if mission.output_path:
+        output = Path(mission.output_path).resolve()
+        if output != expected_output:
+            raise CompressionError(
+                "Mission output path does not match its configured directory"
+            )
+    else:
+        output = expected_output
+    staging = service.staging_path_for(mission.id, output)
+    work = service.work_path_for(mission.id)
+    return source, output, staging, work
+
+
+def fail_mission(mission, error):
+    if isinstance(error, OSError):
+        detail = error.strerror or error.__class__.__name__
+        message = f"Filesystem operation failed for {mission.file_name}: {detail}"
+    else:
+        message = str(error)
+        for value in (mission.source_path, mission.output_path):
+            if not value:
+                continue
+            path = Path(value)
+            message = message.replace(str(path), path.name)
+            message = message.replace(str(path.parent), "<configured-directory>")
+    mission.status = CompressionStatus.FAILED
+    mission.error_message = message[-2000:]
+    db.session.commit()
+    print(f"视频压缩失败: {mission.file_name}: {mission.error_message}")
+
+
+def files_are_same(first, second):
+    try:
+        return first.samefile(second)
+    except OSError:
+        return False
+
+
+def finish_cleanup_pending(service, source_directory):
     mission = (
         CompressionMission.query.filter_by(status=CompressionStatus.CLEANUP_PENDING)
         .order_by(CompressionMission.id)
@@ -134,20 +185,177 @@ def finish_cleanup_pending():
     )
     if mission is None:
         return False
-    output = Path(mission.output_path) if mission.output_path else None
-    if output is None or not output.is_file():
-        mission.status = CompressionStatus.FAILED
-        mission.error_message = "Published output is missing; source was preserved."
-        db.session.commit()
+    try:
+        source, output, staging, _ = mission_paths(
+            mission, service, source_directory
+        )
+        if not output.is_file():
+            raise CompressionError(
+                "Published output is missing; source was preserved."
+            )
+        if staging.exists() and not files_are_same(staging, output):
+            raise CompressionError(
+                "Mission staging file does not match the published output"
+            )
+        service.validate_output(output)
+        service.discard_staging_file(mission.id, output)
+        service.discard_work_file(mission.id)
+        source.unlink(missing_ok=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        fail_mission(mission, error)
         return True
-    service = CompressionService(
-        EnvConfig.video_compression_ffmpeg_bin_directory(), output.parent
-    )
-    service.validate_output(output)
-    Path(mission.source_path).unlink(missing_ok=True)
+
     mission.status = CompressionStatus.COMPLETED
+    mission.output_path = str(output)
     mission.error_message = None
     db.session.commit()
+    return True
+
+
+def recover_validating_mission(service, source_directory):
+    mission = (
+        CompressionMission.query.filter_by(status=CompressionStatus.VALIDATING)
+        .order_by(CompressionMission.id)
+        .first()
+    )
+    if mission is None:
+        return False
+
+    try:
+        source, output, staging, _ = mission_paths(
+            mission, service, source_directory
+        )
+        source_exists = source.is_file()
+        output_exists = output.is_file()
+        staging_exists = staging.is_file()
+
+        if not source_exists:
+            if not output_exists:
+                raise CompressionError(
+                    "Source and published output are both missing"
+                )
+            if staging_exists and not files_are_same(staging, output):
+                raise CompressionError(
+                    "Mission staging file does not match the published output"
+                )
+            service.validate_output(output)
+            service.discard_staging_file(mission.id, output)
+            service.discard_work_file(mission.id)
+            mission.status = CompressionStatus.COMPLETED
+            mission.output_path = str(output)
+            mission.error_message = None
+            db.session.commit()
+            return True
+
+        if not staging_exists:
+            if output_exists:
+                raise CompressionError(
+                    "Published output exists but its ownership cannot be verified"
+                )
+            service.discard_work_file(mission.id)
+            mission.status = CompressionStatus.READY
+            mission.output_path = str(output)
+            mission.error_message = "Recovered interrupted validation; retry queued."
+            db.session.commit()
+            return True
+
+        if output_exists:
+            if not files_are_same(staging, output):
+                raise CompressionError(
+                    "Published output conflicts with the mission staging file"
+                )
+            service.validate_output(output)
+        else:
+            service.publish_prepared(mission.id, output)
+
+        mission.status = CompressionStatus.CLEANUP_PENDING
+        mission.output_path = str(output)
+        mission.error_message = None
+        db.session.commit()
+        service.discard_staging_file(mission.id, output)
+        service.discard_work_file(mission.id)
+    except (OSError, RuntimeError, ValueError) as error:
+        fail_mission(mission, error)
+    return True
+
+
+def recover_processing_mission(service, source_directory):
+    mission = (
+        CompressionMission.query.filter_by(status=CompressionStatus.PROCESSING)
+        .order_by(CompressionMission.id)
+        .first()
+    )
+    if mission is None:
+        return False
+
+    try:
+        source, output, staging, _ = mission_paths(
+            mission, service, source_directory
+        )
+        source_exists = source.is_file()
+        output_exists = output.is_file()
+        staging_exists = staging.is_file()
+
+        if not source_exists:
+            if not output_exists:
+                raise CompressionError(
+                    "Source and published output are both missing"
+                )
+            if staging_exists and not files_are_same(staging, output):
+                raise CompressionError(
+                    "Mission staging file does not match the published output"
+                )
+            service.validate_output(output)
+            service.discard_staging_file(mission.id, output)
+            service.discard_work_file(mission.id)
+            mission.status = CompressionStatus.COMPLETED
+            mission.output_path = str(output)
+            mission.error_message = None
+            db.session.commit()
+            return True
+
+        if output_exists:
+            if not staging_exists or not files_are_same(staging, output):
+                raise CompressionError(
+                    "Published output exists but its ownership cannot be verified"
+                )
+            service.validate_output(output)
+            mission.status = CompressionStatus.CLEANUP_PENDING
+            mission.output_path = str(output)
+            mission.error_message = None
+            db.session.commit()
+            service.discard_staging_file(mission.id, output)
+            service.discard_work_file(mission.id)
+            return True
+
+        if staging_exists:
+            try:
+                service.validate_output(staging)
+            except RuntimeError:
+                service.discard_staging_file(mission.id, output)
+                service.discard_work_file(mission.id)
+                mission.status = CompressionStatus.READY
+                mission.output_path = str(output)
+                mission.error_message = (
+                    "Recovered interrupted processing; retry queued."
+                )
+                db.session.commit()
+                return True
+
+            service.discard_work_file(mission.id)
+            mission.status = CompressionStatus.VALIDATING
+            mission.output_path = str(output)
+            mission.error_message = None
+            db.session.commit()
+            return True
+
+        service.discard_work_file(mission.id)
+        mission.status = CompressionStatus.READY
+        mission.output_path = str(output)
+        mission.error_message = "Recovered interrupted processing; retry queued."
+        db.session.commit()
+    except (OSError, RuntimeError, ValueError) as error:
+        fail_mission(mission, error)
     return True
 
 
@@ -156,38 +364,68 @@ def process_one_mission():
     output_dir = EnvConfig.video_compression_output_directory()
     if source_dir == output_dir:
         raise RuntimeError("Video source and output directories must be different.")
-    if finish_cleanup_pending():
-        return None
-    refresh_missions(source_dir)
-    mission = claim_next_mission()
-    if mission is None:
-        return None
-
     service = CompressionService(
         EnvConfig.video_compression_ffmpeg_bin_directory(), output_dir
     )
-    mission_id = mission.id
-    try:
-        def record_published(destination):
-            mission.status = CompressionStatus.CLEANUP_PENDING
-            mission.output_path = str(destination)
-            db.session.commit()
+    if finish_cleanup_pending(service, source_dir):
+        return None
+    if recover_validating_mission(service, source_dir):
+        return None
+    if recover_processing_mission(service, source_dir):
+        return None
+    refresh_missions(source_dir)
+    mission = claim_next_mission(service)
+    if mission is None:
+        return None
 
-        result = service.process(mission.source_path, record_published)
-        mission.status = CompressionStatus.COMPLETED
-        mission.output_path = str(result.destination)
-        mission.error_message = None
-        db.session.commit()
-        return result
+    mission_id = mission.id
+    output = None
+    try:
+        source, output, _, _ = mission_paths(mission, service, source_dir)
+        prepared = service.prepare(source, mission.id, output)
     except Exception as error:
         db.session.rollback()
         mission = db.session.get(CompressionMission, mission_id)
-        if mission.status != CompressionStatus.CLEANUP_PENDING:
-            mission.status = CompressionStatus.FAILED
-            mission.error_message = str(error)[-2000:]
-        db.session.commit()
-        print(f"视频压缩失败: {mission.file_name}: {mission.error_message}")
+        if output is not None:
+            try:
+                service.discard_staging_file(mission.id, output)
+            except OSError:
+                pass
+        try:
+            service.discard_work_file(mission.id)
+        except OSError:
+            pass
+        fail_mission(mission, error)
         return None
+
+    mission.status = CompressionStatus.VALIDATING
+    mission.output_path = str(prepared.destination)
+    mission.error_message = None
+    db.session.commit()
+
+    try:
+        service.publish_prepared(mission.id, prepared.destination)
+    except (OSError, RuntimeError, ValueError) as error:
+        fail_mission(mission, error)
+        return None
+
+    mission.status = CompressionStatus.CLEANUP_PENDING
+    mission.output_path = str(prepared.destination)
+    mission.error_message = None
+    db.session.commit()
+
+    try:
+        service.discard_staging_file(mission.id, prepared.destination)
+        service.discard_work_file(mission.id)
+        source.unlink(missing_ok=True)
+    except OSError as error:
+        fail_mission(mission, error)
+        return None
+
+    mission.status = CompressionStatus.COMPLETED
+    mission.error_message = None
+    db.session.commit()
+    return prepared
 
 
 @scheduler.task(

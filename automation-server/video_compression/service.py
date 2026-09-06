@@ -19,6 +19,13 @@ class CompressionResult:
     transcoded: bool
 
 
+@dataclass(frozen=True)
+class PreparedCompression:
+    destination: Path
+    staging: Path
+    transcoded: bool
+
+
 class CompressionService:
     def __init__(self, ffmpeg_bin_dir, output_dir, cache_dir=None):
         self.ffmpeg_bin_dir = Path(ffmpeg_bin_dir)
@@ -42,6 +49,133 @@ class CompressionService:
         duration = info.duration or 0
         verify_decodable(path, self.ffmpeg_path, timeout=max(120, int(duration * 2 + 60)))
         return info
+
+    @staticmethod
+    def _direct_child(path, directory, description):
+        directory = Path(directory).resolve()
+        path = Path(path)
+        parent = path.parent.resolve()
+        if parent != directory:
+            raise CompressionError(f"{description} is outside its configured directory")
+        path = parent / path.name
+        if path.is_symlink():
+            raise CompressionError(f"{description} must not be a symbolic link")
+        return path
+
+    def destination_for(self, file_name):
+        if not file_name or Path(file_name).name != file_name:
+            raise CompressionError("Mission file name is invalid")
+        return self._direct_child(
+            self.output_dir / file_name,
+            self.output_dir,
+            "Output path",
+        )
+
+    def work_path_for(self, mission_id):
+        return self._direct_child(
+            self.cache_dir / f".mission-{int(mission_id)}.transcoding.mp4",
+            self.cache_dir,
+            "Work path",
+        )
+
+    def staging_path_for(self, mission_id, destination):
+        destination = self._direct_child(
+            destination,
+            self.output_dir,
+            "Output path",
+        )
+        return self._direct_child(
+            destination.with_name(
+                f".{destination.name}.mission-{int(mission_id)}.part"
+            ),
+            self.output_dir,
+            "Staging path",
+        )
+
+    @staticmethod
+    def _copy_without_overwrite(source, destination):
+        with Path(source).open("rb") as source_stream, Path(destination).open(
+            "xb"
+        ) as destination_stream:
+            shutil.copyfileobj(source_stream, destination_stream)
+        shutil.copystat(source, destination)
+
+    def discard_work_file(self, mission_id):
+        self.work_path_for(mission_id).unlink(missing_ok=True)
+
+    def discard_staging_file(self, mission_id, destination):
+        self.staging_path_for(mission_id, destination).unlink(missing_ok=True)
+
+    def prepare(self, source, mission_id, destination):
+        source = Path(source).resolve()
+        if not source.is_file():
+            raise CompressionError(f"Source file does not exist: {source.name}")
+        if source.suffix.lower() != ".mp4":
+            raise CompressionError(f"Only MP4 files are supported: {source.name}")
+
+        self._validate_tools_and_paths()
+        expected_destination = self.destination_for(source.name)
+        destination = self._direct_child(
+            destination,
+            self.output_dir,
+            "Output path",
+        )
+        if destination != expected_destination:
+            raise CompressionError("Mission output path does not match its file name")
+        if destination == source:
+            raise CompressionError("Source and output directories must be different")
+        if destination.exists():
+            raise CompressionError(f"Output file already exists: {destination.name}")
+
+        staging = self.staging_path_for(mission_id, destination)
+        work = self.work_path_for(mission_id)
+        if staging.exists():
+            raise CompressionError("Mission staging file already exists")
+        if work.exists():
+            raise CompressionError("Mission work file already exists")
+
+        source_info = probe_video(source, self.ffprobe_path)
+        plan = make_plan(source_info)
+        if not plan.transcode:
+            self.validate_output(source)
+            self._copy_without_overwrite(source, staging)
+            return PreparedCompression(
+                destination=destination,
+                staging=staging,
+                transcoded=False,
+            )
+
+        try:
+            duration = source_info.duration or 0
+            transcode(
+                self.ffmpeg_path,
+                source,
+                work,
+                plan,
+                timeout=max(900, int(duration * 10 + 300)),
+            )
+            self.validate_output(work)
+            self._copy_without_overwrite(work, staging)
+            return PreparedCompression(
+                destination=destination,
+                staging=staging,
+                transcoded=True,
+            )
+        finally:
+            work.unlink(missing_ok=True)
+
+    def publish_prepared(self, mission_id, destination):
+        destination = self._direct_child(
+            destination,
+            self.output_dir,
+            "Output path",
+        )
+        staging = self.staging_path_for(mission_id, destination)
+        if not staging.is_file():
+            raise CompressionError("Mission staging file does not exist")
+        self.validate_output(staging)
+        os.link(staging, destination)
+        return staging
 
     def _publish_and_remove_source(
         self, artifact, source, destination, published_callback=None

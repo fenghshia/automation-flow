@@ -4,6 +4,7 @@
 # 目录
 .vscode
 automation-server/video_compression/cache/
+automation-server/image_compression/pending/
 automation-server/iwara/browser-plugin/dist/
 automation-server/jd_auto_match/models/storage/
 
@@ -11,6 +12,7 @@ automation-server/jd_auto_match/models/storage/
 .webui_secret_key
 command.sh
 # env-setup.sh
+error.log
 automation-server/.env
 automation-server/private/
 automation-server/jd_auto_match/jl.md
