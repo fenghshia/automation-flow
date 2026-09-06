@@ -9,6 +9,7 @@ class EnvConfig:
     """Loads and validates runtime environment configuration."""
 
     _dotenv_path = Path(__file__).with_name(".env")
+    _project_dir = Path(__file__).parent
     _loaded = False
 
     @classmethod
@@ -37,3 +38,52 @@ class EnvConfig:
             f"{quote_plus(os.environ['DB_USER'])}:{quote_plus(os.environ['DB_PASSWORD'])}"
             f"@{os.environ['DB_HOST']}:{os.environ['DB_PORT']}/{os.environ['DB_NAME']}"
         )
+
+    @classmethod
+    def _read_text_file(cls, environment_variable, description):
+        cls._load()
+
+        file_path = os.getenv(environment_variable)
+        if not file_path:
+            raise RuntimeError(f"{environment_variable} must be set.")
+
+        path = Path(file_path)
+        if not path.is_absolute():
+            path = cls._project_dir / path
+
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError as error:
+            raise RuntimeError(f"The {description} file could not be found.") from error
+
+        if not content:
+            raise RuntimeError(f"The {description} file must not be empty.")
+
+        return content
+
+    @classmethod
+    def score_rules(cls):
+        return cls._read_text_file("JD_SCORE_RULES_FILE", "score rules")
+
+    @classmethod
+    def resume(cls):
+        return cls._read_text_file("JD_RESUME_FILE", "resume")
+
+    @classmethod
+    def gemini_client_kwargs(cls):
+        cls._load()
+
+        required_settings = ("GEMINI_API_KEY", "GEMINI_BASE_URL")
+        missing_settings = [name for name in required_settings if not os.getenv(name)]
+        if missing_settings:
+            raise RuntimeError(
+                "Gemini configuration is incomplete. Set GEMINI_API_KEY and GEMINI_BASE_URL."
+            )
+
+        return {
+            "api_key": os.environ["GEMINI_API_KEY"],
+            "http_options": {
+                "base_url": os.environ["GEMINI_BASE_URL"],
+                "api_version": "v1beta",
+            },
+        }
