@@ -3,8 +3,9 @@
 
 # 目录
 .vscode
-automation-server/iwara/browser-plugin/dist
-automation-server/jd_auto_match/models/storage
+automation-server/video_compression/cache/
+automation-server/iwara/browser-plugin/dist/
+automation-server/jd_auto_match/models/storage/
 
 # 独立文件
 .webui_secret_key

@@ -111,3 +111,28 @@ class EnvConfig:
             raise RuntimeError("IWARA_DOWNLOAD_DIR must be set.")
 
         return download_directory
+
+    @classmethod
+    def _required_directory(cls, environment_variable):
+        cls._load()
+
+        value = os.getenv(environment_variable)
+        if not value:
+            raise RuntimeError(f"{environment_variable} must be set.")
+
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = cls._project_dir / path
+        return path.resolve()
+
+    @classmethod
+    def video_compression_source_directory(cls):
+        return cls._required_directory("VIDEO_COMPRESSION_SOURCE_DIR")
+
+    @classmethod
+    def video_compression_output_directory(cls):
+        return cls._required_directory("VIDEO_COMPRESSION_OUTPUT_DIR")
+
+    @classmethod
+    def video_compression_ffmpeg_bin_directory(cls):
+        return cls._required_directory("VIDEO_COMPRESSION_FFMPEG_BIN_DIR")
