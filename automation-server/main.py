@@ -2,6 +2,7 @@ from app import app, scheduler
 from iwara import *
 from jd_auto_match import *
 from video_compression import *
+from image_compression import *
 
 
 def run():

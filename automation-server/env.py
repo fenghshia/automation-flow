@@ -136,3 +136,15 @@ class EnvConfig:
     @classmethod
     def video_compression_ffmpeg_bin_directory(cls):
         return cls._required_directory("VIDEO_COMPRESSION_FFMPEG_BIN_DIR")
+
+    @classmethod
+    def image_compression_source_directory(cls):
+        return cls._required_directory("IMAGE_COMPRESSION_SOURCE_DIR")
+
+    @classmethod
+    def image_compression_output_directory(cls):
+        return cls._required_directory("IMAGE_COMPRESSION_OUTPUT_DIR")
+
+    @classmethod
+    def image_compression_7zip_bin_directory(cls):
+        return cls._required_directory("IMAGE_COMPRESSION_7ZIP_BIN_DIR")

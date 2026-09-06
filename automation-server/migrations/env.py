@@ -8,6 +8,7 @@ from app import db
 from env import EnvConfig
 from iwara import *
 from video_compression import *
+from image_compression import *
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
