@@ -1,0 +1,7 @@
+# 目录
+.vscode
+
+# 独立文件
+.webui_secret_key
+command.sh
+# env-setup.sh
