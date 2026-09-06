@@ -1,4 +1,8 @@
+from contextlib import contextmanager
 from pathlib import Path
+
+from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert
 
 from app import app, db, scheduler
 from env import EnvConfig
@@ -7,6 +11,26 @@ from ..service import CompressionService
 
 
 SUPPORTED_SUFFIXES = {".mp4"}
+VIDEO_COMPRESSION_ADVISORY_LOCK_ID = 0x564944454F434D50
+
+
+@contextmanager
+def video_compression_lock(engine):
+    with engine.connect() as connection:
+        acquired = bool(
+            connection.execute(
+                text("SELECT pg_try_advisory_lock(:lock_id)"),
+                {"lock_id": VIDEO_COMPRESSION_ADVISORY_LOCK_ID},
+            ).scalar_one()
+        )
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                connection.execute(
+                    text("SELECT pg_advisory_unlock(:lock_id)"),
+                    {"lock_id": VIDEO_COMPRESSION_ADVISORY_LOCK_ID},
+                )
 
 
 def discover_source_files(source_directory):
@@ -20,22 +44,31 @@ def discover_source_files(source_directory):
     )
 
 
+def insert_mission_if_missing(session, path, stat):
+    statement = (
+        insert(CompressionMission)
+        .values(
+            source_path=str(path),
+            file_name=path.name,
+            size_bytes=stat.st_size,
+            modified_ns=stat.st_mtime_ns,
+            stable_checks=0,
+            status=CompressionStatus.WAITING_STABLE,
+        )
+        .on_conflict_do_nothing(index_elements=[CompressionMission.source_path])
+        .returning(CompressionMission.id)
+    )
+    return session.execute(statement).scalar_one_or_none() is not None
+
+
 def refresh_missions(source_directory):
     for path in discover_source_files(source_directory):
         stat = path.stat()
         source_path = str(path)
+        if insert_mission_if_missing(db.session, path, stat):
+            continue
         mission = CompressionMission.query.filter_by(source_path=source_path).first()
         if mission is None:
-            db.session.add(
-                CompressionMission(
-                    source_path=source_path,
-                    file_name=path.name,
-                    size_bytes=stat.st_size,
-                    modified_ns=stat.st_mtime_ns,
-                    stable_checks=0,
-                    status=CompressionStatus.WAITING_STABLE,
-                )
-            )
             continue
         if mission.status == CompressionStatus.COMPLETED:
             mission.file_name = path.name
@@ -167,4 +200,10 @@ def process_one_mission():
 )
 def compress_videos():
     with app.app_context():
-        process_one_mission()
+        try:
+            with video_compression_lock(db.engine) as acquired:
+                if acquired:
+                    process_one_mission()
+        except Exception:
+            db.session.rollback()
+            raise

@@ -21,4 +21,3 @@ db.init_app(app)
 
 scheduler = APScheduler()
 scheduler.init_app(app)
-scheduler.start()
