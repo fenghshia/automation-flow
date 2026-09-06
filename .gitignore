@@ -1,3 +1,6 @@
+# 范匹配
+*.pyc
+
 # 目录
 .vscode
 
@@ -5,3 +8,4 @@
 .webui_secret_key
 command.sh
 # env-setup.sh
+automation-server/.env
