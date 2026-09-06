@@ -8,4 +8,5 @@
 - 权限、host permissions、内容脚本匹配范围和页面注入时机遵循最小范围；新增权限必须与具体功能对应。
 - 后台脚本、内容脚本与本地 Flask API 的消息格式必须一致。网络失败、服务未启动或页面结构不匹配时应安全失败，不持续刷请求。
 - 不把 token、cookie、真实请求头、个人数据或本机专属配置写入 manifest、源码或构建脚本。
+- Firefox 签名凭证只能通过 `WEB_EXT_SIGN_API_KEY`、`WEB_EXT_SIGN_API_SECRET` 等子进程环境传递，不得使用含真实值的 `--api-key`、`--api-secret` 命令参数。已有 Python 构建包装脚本时优先复用；只有用户明确要求签名或发布时才调用真实服务。
 - 若已安装 `web-ext`，从目标 `browser-plugin/` 目录运行 `web-ext lint --source-dir code`。只有用户要求构建时才运行打包流程；构建后报告生成文件，不覆盖不相关版本。
