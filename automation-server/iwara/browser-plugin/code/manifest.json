@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Iwara Download Flow",
+  "version": "1.2",
+  "description": "Intercepts iwara.tv downloads and sends them to local server.",
+  "permissions": [
+    "webRequest",
+    "webRequestBlocking",
+    "tabs"
+  ],
+  "host_permissions": [
+    "*://*.iwara.tv/download?*",
+    "http://127.0.0.1:6778/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.iwara.tv/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "iwara-flow@fenzoz.com",
+      "strict_min_version": "109.0"
+    }
+  }
+}

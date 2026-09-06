@@ -87,3 +87,27 @@ class EnvConfig:
                 "api_version": "v1beta",
             },
         }
+
+    @classmethod
+    def web_ext_sign_environment(cls):
+        cls._load()
+
+        required_settings = ("WEB_EXT_SIGN_API_KEY", "WEB_EXT_SIGN_API_SECRET")
+        missing_settings = [name for name in required_settings if not os.getenv(name)]
+        if missing_settings:
+            raise RuntimeError(
+                "web-ext signing configuration is incomplete. Set WEB_EXT_SIGN_API_KEY and "
+                "WEB_EXT_SIGN_API_SECRET."
+            )
+
+        return {name: os.environ[name] for name in required_settings}
+
+    @classmethod
+    def iwara_download_directory(cls):
+        cls._load()
+
+        download_directory = os.getenv("IWARA_DOWNLOAD_DIR")
+        if not download_directory:
+            raise RuntimeError("IWARA_DOWNLOAD_DIR must be set.")
+
+        return download_directory
