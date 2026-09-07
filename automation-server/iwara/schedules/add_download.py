@@ -3,6 +3,7 @@ from env import EnvConfig
 from .base import *
 from pathlib import Path
 from requests import post, RequestException
+from ..console import safe_print
 
 
 @scheduler.task('interval', id='do_add_download', seconds=10, misfire_grace_time=900)
@@ -14,9 +15,9 @@ def do_add_download():
             for mission in dm.all():
                 formed_file_name = form_file_name(mission)
                 if (download_dir / formed_file_name).exists():
-                    print(f"任务下载已完成: {formed_file_name}")
                     mission.status = 9
                     db.session.commit()
+                    safe_print(f"任务下载已完成: {formed_file_name}")
         dm = DownloadMission.query.filter(DownloadMission.status == 1).first()
         if not dm:
             return
@@ -50,18 +51,18 @@ def do_add_download():
                 timeout=30,
             )
         except RequestException as exc:
-            print(f"提交Post报错: {exc}")
             dm.status = 4
             db.session.commit()
+            safe_print(f"提交Post报错: {exc}")
             return
 
         if res.status_code == 200:
-            print(f"下载任务已提交: {formed_file_name}")
+            safe_print(f"下载任务已提交: {formed_file_name}")
             return
         else:
-            print(f"下载任务提交失败, 状态码: {res.status_code}, 响应内容: {res.text}")
             dm.status = 4
             db.session.commit()
+            safe_print(f"下载任务提交失败, 状态码: {res.status_code}, 响应内容: {res.text}")
 
 
 def form_file_name(dm) -> str:

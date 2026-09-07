@@ -1,5 +1,6 @@
 import json
 from .base import *
+from ..console import safe_print
 
 
 @app.route("/iwara/import_download", methods=["POST", "OPTIONS"])
@@ -13,18 +14,20 @@ def import_download():
     data = request.get_json()
     data["headers"] = json.dumps(data["headers"])
     dm = DownloadMission.query.filter(DownloadMission.page_url == data["page_url"]).first()
+    message = None
     if dm and (dm.status == 1 or dm.status == 4):
         dm.headers = data["headers"]
         dm.download_url = data["download_url"]
         dm.status = 1
-        print("下载信息更新: {}".format(dm.title))
+        message = "下载信息更新: {}".format(dm.title)
     elif dm and dm.status == 0:
         dm.headers = data["headers"]
         dm.file_name = data["file_name"]
         dm.download_url = data["download_url"]
         dm.status = 1
-        print("下载已准备好: {}".format(dm.title))
+        message = "下载已准备好: {}".format(dm.title)
     else:
-        print("[ERROR] 下载预载入数据没有")
+        message = "[ERROR] 下载预载入数据没有"
     db.session.commit()
+    safe_print(message)
     return "<p>OK</p>", 200, {"Access-Control-Allow-Origin": "*"}
