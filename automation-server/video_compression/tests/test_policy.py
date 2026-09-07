@@ -22,6 +22,17 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(make_plan(info).transcode)
         self.assertEqual([], validate_specification(info))
 
+    def test_output_validation_allows_bitrate_up_to_5_5_mbps(self):
+        info = VideoInfo("hevc", 1920, 1080, 30.0, 5_500_000, 10.0)
+        self.assertEqual([], validate_specification(info))
+
+    def test_output_validation_rejects_bitrate_above_5_5_mbps(self):
+        info = VideoInfo("hevc", 1920, 1080, 30.0, 5_500_001, 10.0)
+        self.assertEqual(
+            ["average video bitrate is 5500001, above 5500000"],
+            validate_specification(info),
+        )
+
     def test_rotation_uses_display_dimensions(self):
         info = VideoInfo("h264", 3840, 2160, 30.0, 6_000_000, 10.0, rotation=90)
         plan = make_plan(info)
@@ -30,4 +41,3 @@ class PolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

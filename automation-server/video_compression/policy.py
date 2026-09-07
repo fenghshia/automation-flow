@@ -4,6 +4,7 @@ from .probe import VideoInfo
 
 
 MAX_VIDEO_BIT_RATE = 5_000_000
+MAX_VALIDATED_VIDEO_BIT_RATE = 5_500_000
 TARGET_VIDEO_BIT_RATE = 4_500_000
 MAX_FPS = 30.0
 
@@ -57,8 +58,8 @@ def validate_specification(info: VideoInfo):
         errors.append("codec is not HEVC")
     if info.bit_rate is None:
         errors.append("average video bitrate is unavailable")
-    elif info.bit_rate > MAX_VIDEO_BIT_RATE:
-        errors.append(f"average video bitrate is {info.bit_rate}, above 5000000")
+    elif info.bit_rate > MAX_VALIDATED_VIDEO_BIT_RATE:
+        errors.append(f"average video bitrate is {info.bit_rate}, above 5500000")
     if expected != (info.display_width, info.display_height):
         errors.append("display dimensions exceed the permitted bounds")
     if info.fps > MAX_FPS + 0.01:

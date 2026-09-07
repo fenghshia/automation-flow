@@ -58,7 +58,15 @@ FORMAT_EXTENSIONS = {
     "WEBP": {".webp"},
 }
 
-REENCODABLE_FORMATS = {"JPEG", "PNG", "WEBP"}
+PASSTHROUGH_FORMATS = {"GIF", "WEBP"}
+REENCODABLE_FORMATS = {"JPEG", "PNG"}
+
+# These messages identify missions created by the pre-passthrough policy. They
+# are retained only so those failed missions can be recovered safely.
+LEGACY_PASSTHROUGH_FAILURES = frozenset(
+    f"Images of format {image_format} above 3 MiB are not supported"
+    for image_format in PASSTHROUGH_FORMATS
+)
 
 
 def archive_suffix(name):
@@ -68,4 +76,3 @@ def archive_suffix(name):
 
 def is_archive_name(name):
     return archive_suffix(name) is not None
-

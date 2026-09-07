@@ -17,7 +17,7 @@ from ..manifest import (
 )
 from ..models import ImageCompressionMission, ImageCompressionStatus
 from ..naming import collision_key, output_name
-from ..policy import is_archive_name
+from ..policy import LEGACY_PASSTHROUGH_FAILURES, is_archive_name
 from ..service import ImageCompressionService
 
 
@@ -234,6 +234,93 @@ def claim_ready_mission():
     return db.session.get(ImageCompressionMission, candidate.id) if claimed == 1 else None
 
 
+def _retry_assets_are_safe(service, mission):
+    mission_source = service.mission_directory(mission.id) / "source"
+    if not mission_source.exists():
+        return False, "pending source is missing"
+
+    intended_output = (service.output_directory / mission.destination_key).absolute()
+    if intended_output.parent.resolve() != service.output_directory:
+        return False, "destination is outside the configured output directory"
+    if intended_output.exists():
+        return False, "final output already exists"
+    if mission.output_path and Path(mission.output_path).exists():
+        return False, "recorded output already exists"
+    if service.publish_staging_path(mission.id).exists():
+        return False, "publish staging already exists"
+
+    try:
+        service.ensure_ingested(mission.source_path, mission.id)
+    except Exception as error:
+        return False, f"pending source validation failed: {error}"
+    return True, None
+
+
+def _retry_destination_is_reserved(mission):
+    return (
+        ImageCompressionMission.query.filter(
+            ImageCompressionMission.id != mission.id,
+            ImageCompressionMission.destination_key_normalized
+            == mission.destination_key_normalized,
+            ImageCompressionMission.status != ImageCompressionStatus.FAILED,
+        ).first()
+        is not None
+    )
+
+
+def claim_retryable_format_failure(service):
+    candidates = (
+        ImageCompressionMission.query.filter(
+            ImageCompressionMission.status == ImageCompressionStatus.FAILED,
+            ImageCompressionMission.error_message.in_(LEGACY_PASSTHROUGH_FAILURES),
+        )
+        .order_by(ImageCompressionMission.id)
+        .all()
+    )
+    for candidate in candidates:
+        if _retry_destination_is_reserved(candidate):
+            logger.warning(
+                "图片历史失败任务的输出名称已被其他任务占用 | mission_id=%s",
+                candidate.id,
+            )
+            continue
+        safe, reason = _retry_assets_are_safe(service, candidate)
+        if not safe:
+            logger.warning(
+                "图片历史失败任务不满足自动恢复条件 | mission_id=%s | reason=%s",
+                candidate.id,
+                reason,
+            )
+            continue
+
+        original_error = candidate.error_message
+        claimed = (
+            db.session.query(ImageCompressionMission)
+            .filter(
+                ImageCompressionMission.id == candidate.id,
+                ImageCompressionMission.status == ImageCompressionStatus.FAILED,
+                ImageCompressionMission.error_message == original_error,
+            )
+            .update(
+                {
+                    ImageCompressionMission.status: ImageCompressionStatus.PROCESSING,
+                    ImageCompressionMission.attempts: ImageCompressionMission.attempts + 1,
+                    ImageCompressionMission.processing_started_at: datetime.utcnow(),
+                    ImageCompressionMission.output_path: None,
+                    ImageCompressionMission.output_manifest_sha256: None,
+                    ImageCompressionMission.output_file_count: None,
+                    ImageCompressionMission.output_size_bytes: None,
+                    ImageCompressionMission.error_message: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.session.commit()
+        if claimed == 1:
+            return db.session.get(ImageCompressionMission, candidate.id)
+    return None
+
+
 def _expected_manifest(mission):
     if not mission.output_manifest_sha256:
         raise RuntimeError("Mission has no output manifest for recovery")
@@ -385,6 +472,10 @@ def process_one_mission():
     if active is not None:
         return process_mission(service, active)
 
+    retryable = claim_retryable_format_failure(service)
+    if retryable is not None:
+        return process_mission(service, retryable)
+
     waiting = refresh_waiting_mission()
     if waiting is not None:
         if waiting.status == ImageCompressionStatus.READY:
@@ -402,7 +493,7 @@ def process_one_mission():
 @scheduler.task(
     "interval",
     id="image_compression_process_one",
-    seconds=30,
+    seconds=10,
     max_instances=1,
     coalesce=True,
     misfire_grace_time=120,

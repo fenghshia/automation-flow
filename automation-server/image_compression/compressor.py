@@ -9,6 +9,7 @@ from .policy import (
     FORMAT_EXTENSIONS,
     KNOWN_IMAGE_EXTENSIONS,
     MAX_IMAGE_BYTES,
+    PASSTHROUGH_FORMATS,
     REENCODABLE_FORMATS,
 )
 
@@ -182,6 +183,10 @@ class ImageProcessor:
             return False
 
         image_format, animated = inspected
+        if image_format in PASSTHROUGH_FORMATS:
+            copy_verified(source, destination)
+            self.verify(destination, require_limit=False)
+            return False
         if source.stat().st_size <= MAX_IMAGE_BYTES:
             copy_verified(source, destination)
             self.verify(destination, require_limit=True)

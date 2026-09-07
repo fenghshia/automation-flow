@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from image_compression.manifest import ContentManifest
 from image_compression.models import ImageCompressionStatus
+from image_compression.policy import LEGACY_PASSTHROUGH_FAILURES
 
 schedule_module = importlib.import_module(
     "image_compression.schedules.process_images"
@@ -160,6 +161,145 @@ class SchedulerTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(ImageCompressionStatus.CLEANUP_PENDING, mission.status)
         self.assertEqual("busy", mission.error_message)
+
+    def test_legacy_format_errors_are_exactly_scoped(self):
+        self.assertEqual(
+            {
+                "Images of format GIF above 3 MiB are not supported",
+                "Images of format WEBP above 3 MiB are not supported",
+            },
+            LEGACY_PASSTHROUGH_FAILURES,
+        )
+
+    def test_retry_assets_require_pending_source_and_no_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pending = root / "pending"
+            output = root / "output"
+            (pending / "1").mkdir(parents=True)
+            output.mkdir()
+            mission = SimpleNamespace(
+                id=1,
+                source_path=str(root / "source.gif"),
+                destination_key="source.gif",
+                output_path=None,
+            )
+            service = SimpleNamespace(
+                output_directory=output.resolve(),
+                mission_directory=lambda mission_id: pending / str(mission_id),
+                publish_staging_path=lambda mission_id: output
+                / f".autoflow-image-{mission_id}.part",
+                ensure_ingested=MagicMock(),
+            )
+
+            safe, reason = schedule_module._retry_assets_are_safe(service, mission)
+            self.assertFalse(safe)
+            self.assertEqual("pending source is missing", reason)
+
+            (pending / "1" / "source").write_bytes(b"source")
+            safe, reason = schedule_module._retry_assets_are_safe(service, mission)
+            self.assertTrue(safe)
+            self.assertIsNone(reason)
+            service.ensure_ingested.assert_called_once_with(mission.source_path, 1)
+
+            (output / "source.gif").write_bytes(b"existing")
+            safe, reason = schedule_module._retry_assets_are_safe(service, mission)
+            self.assertFalse(safe)
+            self.assertEqual("final output already exists", reason)
+
+            (output / "source.gif").unlink()
+            (output / ".autoflow-image-1.part").write_bytes(b"staged")
+            safe, reason = schedule_module._retry_assets_are_safe(service, mission)
+            self.assertFalse(safe)
+            self.assertEqual("publish staging already exists", reason)
+
+    def test_retry_destination_detects_another_active_mission(self):
+        mission = SimpleNamespace(id=4, destination_key_normalized="source.gif")
+        query = MagicMock()
+        query.filter.return_value.first.return_value = SimpleNamespace(id=5)
+
+        with schedule_module.app.app_context():
+            with patch.object(
+                schedule_module.ImageCompressionMission, "query", query
+            ):
+                reserved = schedule_module._retry_destination_is_reserved(mission)
+
+        self.assertTrue(reserved)
+        query.filter.return_value.first.assert_called_once_with()
+
+    def test_claim_retryable_format_failure_uses_conditional_update(self):
+        candidate = SimpleNamespace(
+            id=4,
+            error_message="Images of format GIF above 3 MiB are not supported",
+            destination_key_normalized="source.gif",
+        )
+        claimed_mission = SimpleNamespace(id=4, status=ImageCompressionStatus.PROCESSING)
+        query = MagicMock()
+        query.filter.return_value.order_by.return_value.all.return_value = [candidate]
+        update_query = MagicMock()
+        update_query.filter.return_value.update.return_value = 1
+        session = MagicMock()
+        session.query.return_value = update_query
+        session.get.return_value = claimed_mission
+
+        with schedule_module.app.app_context():
+            with patch.object(
+                schedule_module.ImageCompressionMission, "query", query
+            ), patch.object(
+                schedule_module.db, "session", session
+            ), patch.object(
+                schedule_module, "_retry_assets_are_safe", return_value=(True, None)
+            ), patch.object(
+                schedule_module, "_retry_destination_is_reserved", return_value=False
+            ):
+                result = schedule_module.claim_retryable_format_failure(MagicMock())
+
+        self.assertIs(claimed_mission, result)
+        update_query.filter.return_value.update.assert_called_once()
+        updates = update_query.filter.return_value.update.call_args.args[0]
+        self.assertEqual(
+            ImageCompressionStatus.PROCESSING,
+            updates[schedule_module.ImageCompressionMission.status],
+        )
+        self.assertIsNone(updates[schedule_module.ImageCompressionMission.error_message])
+        self.assertIsNone(updates[schedule_module.ImageCompressionMission.output_path])
+        session.commit.assert_called_once_with()
+        session.get.assert_called_once_with(schedule_module.ImageCompressionMission, 4)
+
+    def test_claim_retryable_format_failure_skips_unsafe_candidate(self):
+        candidates = [
+            SimpleNamespace(
+                id=4, error_message="first", destination_key_normalized="first.gif"
+            ),
+            SimpleNamespace(
+                id=5, error_message="second", destination_key_normalized="second.gif"
+            ),
+        ]
+        claimed_mission = SimpleNamespace(id=5, status=ImageCompressionStatus.PROCESSING)
+        query = MagicMock()
+        query.filter.return_value.order_by.return_value.all.return_value = candidates
+        update_query = MagicMock()
+        update_query.filter.return_value.update.return_value = 1
+        session = MagicMock()
+        session.query.return_value = update_query
+        session.get.return_value = claimed_mission
+
+        with schedule_module.app.app_context():
+            with patch.object(
+                schedule_module.ImageCompressionMission, "query", query
+            ), patch.object(
+                schedule_module.db, "session", session
+            ), patch.object(
+                schedule_module,
+                "_retry_assets_are_safe",
+                side_effect=[(False, "missing"), (True, None)],
+            ), patch.object(
+                schedule_module, "_retry_destination_is_reserved", return_value=False
+            ):
+                result = schedule_module.claim_retryable_format_failure(MagicMock())
+
+        self.assertIs(claimed_mission, result)
+        session.get.assert_called_once_with(schedule_module.ImageCompressionMission, 5)
 
 
 if __name__ == "__main__":
