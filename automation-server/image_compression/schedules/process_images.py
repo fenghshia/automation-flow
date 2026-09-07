@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from datetime import datetime
+import logging
 from pathlib import Path
 
 from sqlalchemy import text
@@ -7,6 +8,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app import app, db, scheduler
 from env import EnvConfig
+from logging_config import log_exception
 from ..manifest import (
     ContentManifest,
     SourceSnapshot,
@@ -21,6 +23,7 @@ from ..service import ImageCompressionService
 
 IMAGE_COMPRESSION_ADVISORY_LOCK_ID = 0x494D47434D505245
 STABILITY_INTERVAL_SECONDS = 30
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -93,6 +96,12 @@ def register_next_source(source_directory, output_directory=None):
             initial_status = ImageCompressionStatus.WAITING_STABLE
             initial_error = None
         except UnsafeSourceError as error:
+            log_exception(
+                logger,
+                "图片来源安全检查失败 | source=%s",
+                error,
+                path.name,
+            )
             snapshot = SourceSnapshot(0, 0, None, "0" * 64)
             initial_status = ImageCompressionStatus.FAILED
             initial_error = str(error)[-2000:]
@@ -173,6 +182,13 @@ def refresh_waiting_mission(now=None):
     try:
         snapshot = source_snapshot(path)
     except UnsafeSourceError as error:
+        log_exception(
+            logger,
+            "等待中的图片来源安全检查失败 | mission_id=%s | source=%s",
+            error,
+            mission.id,
+            mission.source_name,
+        )
         mission.status = ImageCompressionStatus.FAILED
         mission.error_message = str(error)[-2000:]
         db.session.commit()
@@ -254,6 +270,7 @@ def _recover_publishing(service, mission):
 
 def process_mission(service, mission):
     mission_id = mission.id
+    source_name = mission.source_name
     try:
         if mission.status == ImageCompressionStatus.MOVING:
             service.ensure_ingested(mission.source_path, mission.id)
@@ -291,8 +308,27 @@ def process_mission(service, mission):
             return Path(mission.output_path)
         return None
     except Exception as error:
-        db.session.rollback()
+        log_exception(
+            logger,
+            "图片流水线失败 | mission_id=%s | source=%s",
+            error,
+            mission_id,
+            source_name,
+        )
+        try:
+            db.session.rollback()
+        except Exception as rollback_error:
+            log_exception(
+                logger,
+                "图片任务回滚失败 | mission_id=%s",
+                rollback_error,
+                mission_id,
+            )
+            return None
         mission = db.session.get(ImageCompressionMission, mission_id)
+        if mission is None:
+            logger.error("图片失败任务不存在 | mission_id=%s", mission_id)
+            return None
         if (
             mission.status != ImageCompressionStatus.CLEANUP_PENDING
             or not isinstance(error, OSError)
@@ -301,11 +337,32 @@ def process_mission(service, mission):
         if mission.status == ImageCompressionStatus.FAILED:
             try:
                 service.discard_publish_staging(mission.id)
-            except Exception:
-                pass
+            except Exception as cleanup_error:
+                log_exception(
+                    logger,
+                    "图片发布暂存清理失败 | mission_id=%s",
+                    cleanup_error,
+                    mission_id,
+                )
         mission.error_message = str(error)[-2000:]
-        db.session.commit()
-        print(f"图片流水线失败: {mission.source_name}: {mission.error_message}")
+        try:
+            db.session.commit()
+        except Exception as commit_error:
+            log_exception(
+                logger,
+                "图片失败状态保存失败 | mission_id=%s",
+                commit_error,
+                mission_id,
+            )
+            try:
+                db.session.rollback()
+            except Exception as rollback_error:
+                log_exception(
+                    logger,
+                    "图片失败状态二次回滚失败 | mission_id=%s",
+                    rollback_error,
+                    mission_id,
+                )
         return None
 
 
@@ -351,11 +408,15 @@ def process_one_mission():
     misfire_grace_time=120,
 )
 def process_images():
-    with app.app_context():
-        try:
+    try:
+        with app.app_context():
             with image_compression_lock(db.engine) as acquired:
                 if acquired:
                     process_one_mission()
-        except Exception:
+    except Exception as error:
+        log_exception(logger, "图片定时任务未处理异常", error)
+        try:
             db.session.rollback()
-            raise
+        except Exception as rollback_error:
+            log_exception(logger, "图片定时任务回滚失败", rollback_error)
+        return None

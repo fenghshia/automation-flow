@@ -46,6 +46,55 @@ class SchedulerTests(unittest.TestCase):
             schedule_module.process_images()
         process.assert_not_called()
 
+    def test_job_logs_rolls_back_and_consumes_unhandled_error(self):
+        error = RuntimeError("image-scheduler-marker")
+        with patch.object(
+            schedule_module,
+            "image_compression_lock",
+            return_value=nullcontext(True),
+        ), patch.object(
+            schedule_module,
+            "process_one_mission",
+            side_effect=error,
+        ), patch.object(
+            schedule_module.db.session,
+            "rollback",
+        ) as rollback, patch.object(
+            schedule_module,
+            "log_exception",
+        ) as log_exception:
+            result = schedule_module.process_images()
+
+        self.assertIsNone(result)
+        rollback.assert_called_once_with()
+        self.assertIs(error, log_exception.call_args_list[0].args[2])
+
+    def test_job_preserves_original_error_when_rollback_also_fails(self):
+        original = RuntimeError("image-original-marker")
+        rollback_error = RuntimeError("image-rollback-marker")
+        with patch.object(
+            schedule_module,
+            "image_compression_lock",
+            return_value=nullcontext(True),
+        ), patch.object(
+            schedule_module,
+            "process_one_mission",
+            side_effect=original,
+        ), patch.object(
+            schedule_module.db.session,
+            "rollback",
+            side_effect=rollback_error,
+        ), patch.object(
+            schedule_module,
+            "log_exception",
+        ) as log_exception:
+            result = schedule_module.process_images()
+
+        self.assertIsNone(result)
+        self.assertEqual(2, log_exception.call_count)
+        self.assertIs(original, log_exception.call_args_list[0].args[2])
+        self.assertIs(rollback_error, log_exception.call_args_list[1].args[2])
+
     def test_discovery_is_shallow_and_ignores_quarantine(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

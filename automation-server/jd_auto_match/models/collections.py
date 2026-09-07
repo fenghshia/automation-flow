@@ -1,7 +1,12 @@
 import uuid
+import logging
 import chromadb
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from openai import OpenAI
+from logging_config import log_exception
+
+
+logger = logging.getLogger(__name__)
 
 
 class LMStudioEmbeddingFunction(EmbeddingFunction[Documents]):
@@ -40,20 +45,23 @@ def add_job_semantic_only(title: str, company: str, summary: str, distance_thres
             
             if search_results and search_results['distances'] and len(search_results['distances'][0]) > 0:
                 closest_distance = search_results['distances'][0][0]
-                closest_meta = search_results['metadatas'][0][0]
-                
                 # 【核心拦截逻辑】
                 if closest_distance < distance_threshold:
-                    print(f"⚠️ [语义拦截] 拒绝入库！检测到高度相似的职位。")
-                    print(f"   |> 传入职位信息: {company} - {title}')")
-                    print(f"   |> 库中相似职位: {closest_meta.get('company')} - {closest_meta.get('title')}")
-                    print(f"   |> 当前语义距离: {closest_distance:.4f} (拦截阈值: {distance_threshold})")
+                    logger.info(
+                        "职位语义查重命中 | distance=%.4f | threshold=%.4f",
+                        closest_distance,
+                        distance_threshold,
+                    )
                     return True
                 else:
-                    print(f"🔍 [检查通过] 最相似记录距离为 {closest_distance:.4f}，大于阈值，判定为新职位。")
+                    logger.info(
+                        "职位语义查重通过 | distance=%.4f | threshold=%.4f",
+                        closest_distance,
+                        distance_threshold,
+                    )
                     
-    except Exception as e:
-        print(f"语义检索阶段发生异常: {e}")
+    except Exception as error:
+        log_exception(logger, "职位语义检索异常，将继续保存当前记录", error)
 
     # 顺利通过检查（或者库本身是空的），分配随机 UUID 并入库
     new_id = str(uuid.uuid4())
@@ -66,5 +74,5 @@ def add_job_semantic_only(title: str, company: str, summary: str, distance_thres
             "company": company
         }]
     )
-    print(f"✅ [成功入库] {company} - {title} (分配ID: {new_id})")
+    logger.info("职位记录已入库")
     return False

@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import logging
 from pathlib import Path
 
 from sqlalchemy import text
@@ -6,12 +7,14 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app import app, db, scheduler
 from env import EnvConfig
+from logging_config import log_exception
 from ..models import CompressionMission, CompressionStatus
 from ..service import CompressionError, CompressionService
 
 
 SUPPORTED_SUFFIXES = {".mp4"}
 VIDEO_COMPRESSION_ADVISORY_LOCK_ID = 0x564944454F434D50
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -152,7 +155,14 @@ def mission_paths(mission, service, source_directory):
     return source, output, staging, work
 
 
-def fail_mission(mission, error):
+def fail_mission(mission, error, *, log_error=True):
+    if log_error:
+        log_exception(
+            logger,
+            "视频压缩失败 | mission_id=%s",
+            error,
+            mission.id,
+        )
     if isinstance(error, OSError):
         detail = error.strerror or error.__class__.__name__
         message = f"Filesystem operation failed for {mission.file_name}: {detail}"
@@ -166,14 +176,32 @@ def fail_mission(mission, error):
             message = message.replace(str(path.parent), "<configured-directory>")
     mission.status = CompressionStatus.FAILED
     mission.error_message = message[-2000:]
-    db.session.commit()
-    print(f"视频压缩失败: {mission.file_name}: {mission.error_message}")
+    try:
+        db.session.commit()
+    except Exception as commit_error:
+        log_exception(
+            logger,
+            "视频失败状态保存失败 | mission_id=%s",
+            commit_error,
+            mission.id,
+        )
+        try:
+            db.session.rollback()
+        except Exception as rollback_error:
+            log_exception(
+                logger,
+                "视频失败状态回滚失败 | mission_id=%s",
+                rollback_error,
+                mission.id,
+            )
 
 
 def files_are_same(first, second):
     try:
         return first.samefile(second)
     except OSError:
+        # Failure to compare is treated as "not owned by this mission" so the
+        # caller takes its tested, non-destructive conflict path.
         return False
 
 
@@ -331,7 +359,13 @@ def recover_processing_mission(service, source_directory):
         if staging_exists:
             try:
                 service.validate_output(staging)
-            except RuntimeError:
+            except RuntimeError as validation_error:
+                log_exception(
+                    logger,
+                    "恢复视频任务时暂存文件校验失败，将重新排队 | mission_id=%s",
+                    validation_error,
+                    mission.id,
+                )
                 service.discard_staging_file(mission.id, output)
                 service.discard_work_file(mission.id)
                 mission.status = CompressionStatus.READY
@@ -384,18 +418,46 @@ def process_one_mission():
         source, output, _, _ = mission_paths(mission, service, source_dir)
         prepared = service.prepare(source, mission.id, output)
     except Exception as error:
-        db.session.rollback()
+        log_exception(
+            logger,
+            "视频处理阶段失败 | mission_id=%s",
+            error,
+            mission_id,
+        )
+        try:
+            db.session.rollback()
+        except Exception as rollback_error:
+            log_exception(
+                logger,
+                "视频处理失败后回滚失败 | mission_id=%s",
+                rollback_error,
+                mission_id,
+            )
+            return None
         mission = db.session.get(CompressionMission, mission_id)
+        if mission is None:
+            logger.error("视频失败任务不存在 | mission_id=%s", mission_id)
+            return None
         if output is not None:
             try:
                 service.discard_staging_file(mission.id, output)
-            except OSError:
-                pass
+            except OSError as cleanup_error:
+                log_exception(
+                    logger,
+                    "视频暂存文件清理失败 | mission_id=%s",
+                    cleanup_error,
+                    mission_id,
+                )
         try:
             service.discard_work_file(mission.id)
-        except OSError:
-            pass
-        fail_mission(mission, error)
+        except OSError as cleanup_error:
+            log_exception(
+                logger,
+                "视频工作文件清理失败 | mission_id=%s",
+                cleanup_error,
+                mission_id,
+            )
+        fail_mission(mission, error, log_error=False)
         return None
 
     mission.status = CompressionStatus.VALIDATING
@@ -437,11 +499,15 @@ def process_one_mission():
     misfire_grace_time=120,
 )
 def compress_videos():
-    with app.app_context():
-        try:
+    try:
+        with app.app_context():
             with video_compression_lock(db.engine) as acquired:
                 if acquired:
                     process_one_mission()
-        except Exception:
+    except Exception as error:
+        log_exception(logger, "视频定时任务未处理异常", error)
+        try:
             db.session.rollback()
-            raise
+        except Exception as rollback_error:
+            log_exception(logger, "视频定时任务回滚失败", rollback_error)
+        return None

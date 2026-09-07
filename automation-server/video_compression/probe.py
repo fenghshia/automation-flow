@@ -34,6 +34,7 @@ def _number(value, converter, default=None):
     try:
         return converter(value)
     except (TypeError, ValueError, ZeroDivisionError):
+        # Optional ffprobe fields use invalid/missing values as a normal signal.
         return default
 
 

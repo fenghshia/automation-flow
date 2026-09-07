@@ -1,5 +1,7 @@
 # 范匹配
 *.pyc
+automation-server/logs/
+automation-server/**/logs/
 
 # 目录
 .vscode

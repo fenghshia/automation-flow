@@ -1,6 +1,8 @@
-import json
+import logging
 from .base import *
-from ..console import safe_print
+
+
+logger = logging.getLogger(__name__)
 
 
 @app.route("/iwara/prepare_download", methods=["POST", "OPTIONS"])
@@ -20,5 +22,5 @@ def prepare_download():
         created = True
     db.session.commit()
     if created:
-        safe_print("下载信息已预载入: {}".format(dm.title))
+        logger.info("下载信息已预载入")
     return "<p>OK</p>", 200, {"Access-Control-Allow-Origin": "*"}
