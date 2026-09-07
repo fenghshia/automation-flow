@@ -1,5 +1,8 @@
-import json
+import logging
 from .base import *
+
+
+logger = logging.getLogger(__name__)
 
 
 @app.route("/iwara/prepare_download", methods=["POST", "OPTIONS"])
@@ -15,6 +18,6 @@ def prepare_download():
     if not dm:
         dm = DownloadMission(**data)
         db.session.add(dm)
-        print("下载信息已预载入: {}".format(dm.title))
+        logger.info("下载信息已预载入")
     db.session.commit()
     return "<p>OK</p>", 200, {"Access-Control-Allow-Origin": "*"}

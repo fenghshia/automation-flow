@@ -306,7 +306,8 @@ class CrossProcessLockTests(unittest.TestCase):
 
         process.assert_not_called()
 
-    def test_job_rolls_back_and_reraises_unhandled_error(self):
+    def test_job_logs_rolls_back_and_consumes_unhandled_error(self):
+        error = RuntimeError("video-scheduler-marker")
         with schedule_module.app.app_context(), patch.object(
             schedule_module,
             "video_compression_lock",
@@ -314,12 +315,19 @@ class CrossProcessLockTests(unittest.TestCase):
         ), patch.object(
             schedule_module,
             "process_one_mission",
-            side_effect=RuntimeError("failed"),
-        ), patch.object(schedule_module.db.session, "rollback") as rollback:
-            with self.assertRaisesRegex(RuntimeError, "failed"):
-                schedule_module.compress_videos()
+            side_effect=error,
+        ), patch.object(
+            schedule_module.db.session,
+            "rollback",
+        ) as rollback, patch.object(
+            schedule_module,
+            "log_exception",
+        ) as log_exception:
+            result = schedule_module.compress_videos()
 
+        self.assertIsNone(result)
         rollback.assert_called_once_with()
+        self.assertIs(error, log_exception.call_args_list[0].args[2])
 
 
 if __name__ == "__main__":

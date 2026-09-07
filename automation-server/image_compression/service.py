@@ -152,6 +152,8 @@ class ImageCompressionService:
                 data["digest"], int(data["file_count"]), int(data["size_bytes"])
             )
         except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            # A missing or invalid marker is an expected recovery signal; callers
+            # validate staged content before choosing a safe recovery path.
             return None
 
     def ensure_ingested(self, source_path, mission_id):

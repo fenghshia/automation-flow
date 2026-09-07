@@ -1,5 +1,9 @@
 import json
+import logging
 from .base import *
+
+
+logger = logging.getLogger(__name__)
 
 
 @app.route("/iwara/import_download", methods=["POST", "OPTIONS"])
@@ -17,14 +21,14 @@ def import_download():
         dm.headers = data["headers"]
         dm.download_url = data["download_url"]
         dm.status = 1
-        print("下载信息更新: {}".format(dm.title))
+        logger.info("下载信息已更新 | mission_id=%s", dm.id)
     elif dm and dm.status == 0:
         dm.headers = data["headers"]
         dm.file_name = data["file_name"]
         dm.download_url = data["download_url"]
         dm.status = 1
-        print("下载已准备好: {}".format(dm.title))
+        logger.info("下载任务已准备 | mission_id=%s", dm.id)
     else:
-        print("[ERROR] 下载预载入数据没有")
+        logger.error("下载预载入任务不存在")
     db.session.commit()
     return "<p>OK</p>", 200, {"Access-Control-Allow-Origin": "*"}

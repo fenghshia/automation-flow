@@ -11,12 +11,40 @@ class EnvConfig:
     _dotenv_path = Path(__file__).with_name(".env")
     _project_dir = Path(__file__).parent
     _loaded = False
+    _logging_redaction_variables = (
+        "DATABASE_URL",
+        "DB_HOST",
+        "DB_PASSWORD",
+        "GEMINI_API_KEY",
+        "GEMINI_BASE_URL",
+        "WEB_EXT_SIGN_API_KEY",
+        "WEB_EXT_SIGN_API_SECRET",
+        "IWARA_DOWNLOAD_DIR",
+        "JD_SCORE_RULES_FILE",
+        "JD_RESUME_FILE",
+        "VIDEO_COMPRESSION_SOURCE_DIR",
+        "VIDEO_COMPRESSION_OUTPUT_DIR",
+        "VIDEO_COMPRESSION_FFMPEG_BIN_DIR",
+        "IMAGE_COMPRESSION_SOURCE_DIR",
+        "IMAGE_COMPRESSION_OUTPUT_DIR",
+        "IMAGE_COMPRESSION_7ZIP_BIN_DIR",
+    )
 
     @classmethod
     def _load(cls):
         if not cls._loaded:
             load_dotenv(cls._dotenv_path)
             cls._loaded = True
+
+    @classmethod
+    def logging_redaction_values(cls):
+        """Return configured secrets and private paths for log masking."""
+        cls._load()
+        return tuple(
+            os.environ[name]
+            for name in cls._logging_redaction_variables
+            if os.getenv(name)
+        )
 
     @classmethod
     def database_uri(cls):

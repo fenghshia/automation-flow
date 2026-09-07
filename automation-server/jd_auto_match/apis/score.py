@@ -1,7 +1,11 @@
 import lmstudio as lms
 import json
+import logging
 from env import EnvConfig
 from .base import *
+
+
+logger = logging.getLogger(__name__)
 
 
 @app.route("/jdam/score", methods=["POST", "OPTIONS"])
@@ -13,7 +17,7 @@ def score():
             "Access-Control-Allow-Methods": "POST, OPTIONS"
         }
     data = request.get_json()
-    print(data)
+    logger.info("收到职位评分请求")
     myq = EnvConfig.score_rules()
     myq += """
 >>>>>>>>>>以下是职位原始信息(冲突的信息均以描述中的为准, 冲突则扣分)
@@ -31,7 +35,6 @@ def score():
 {}
 """.format(jl)
     # res = {"title": "职位标题", "company": "公司名称", "score": 60, "recommend": True, "reason": "推荐或不推荐原因", "summary": "职位关键信息摘要", "asr": "加减分数的过程"}
-    # print(myq)
     interaction = gemini.models.generate_content(
         model="gemini-3.5-flash-low",
         contents=myq
