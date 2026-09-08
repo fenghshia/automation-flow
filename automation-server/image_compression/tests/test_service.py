@@ -105,6 +105,26 @@ class ServiceLifecycleTests(unittest.TestCase):
                 {path.name for path in prepared.result_path.iterdir()},
             )
 
+    def test_prepare_batch_logs_each_file_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.make_service(root)
+            source = service.source_directory / "group"
+            source.mkdir()
+            (source / "first.jpg").write_bytes(b"first")
+            (source / "second.png").write_bytes(b"second")
+            service.ensure_ingested(source, 11)
+
+            with self.assertLogs("image_compression.service", level="INFO") as logs:
+                service.prepare_batch(11, "directory", "group", "group")
+
+            output = "\n".join(logs.output)
+            self.assertIn("progress=1/2", output)
+            self.assertIn("progress=2/2", output)
+            self.assertIn("percent=100%", output)
+            self.assertEqual(2, output.count("批次文件处理完成"))
+            self.assertEqual(2, output.count("action=copied"))
+
     def test_publish_then_cleanup_removes_only_pending_data(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

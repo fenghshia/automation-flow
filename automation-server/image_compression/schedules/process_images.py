@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from datetime import datetime
 import logging
 from pathlib import Path
+import time
 
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert
@@ -147,6 +148,20 @@ def register_next_source(source_directory, output_directory=None):
         )
         db.session.execute(statement)
         db.session.commit()
+        log_method = (
+            logger.warning
+            if values["status"] == ImageCompressionStatus.FAILED
+            else logger.info
+        )
+        log_method(
+            "登记图片来源 | source=%s | source_kind=%s | file_count=%s | "
+            "size_bytes=%s | status=%s",
+            path.name,
+            kind,
+            snapshot.file_count,
+            snapshot.size_bytes,
+            values["status"],
+        )
         return True
     return False
 
@@ -178,6 +193,11 @@ def refresh_waiting_mission(now=None):
         mission.status = ImageCompressionStatus.FAILED
         mission.error_message = "Source disappeared while waiting for stability"
         db.session.commit()
+        logger.warning(
+            "等待稳定的图片来源已消失 | mission_id=%s | source=%s",
+            mission.id,
+            mission.source_name,
+        )
         return mission
     try:
         snapshot = source_snapshot(path)
@@ -196,11 +216,27 @@ def refresh_waiting_mission(now=None):
     if _snapshot_matches(mission, snapshot):
         mission.stable_checks += 1
         mission.status = ImageCompressionStatus.READY
+        logger.info(
+            "图片来源已稳定，进入待处理队列 | mission_id=%s | source=%s | "
+            "file_count=%s | size_bytes=%s",
+            mission.id,
+            mission.source_name,
+            snapshot.file_count,
+            snapshot.size_bytes,
+        )
     else:
         for key, value in _snapshot_values(snapshot).items():
             setattr(mission, key, value)
         mission.stable_checks = 0
         mission.error_message = None
+        logger.info(
+            "图片来源仍在变化，重新等待稳定 | mission_id=%s | source=%s | "
+            "file_count=%s | size_bytes=%s",
+            mission.id,
+            mission.source_name,
+            snapshot.file_count,
+            snapshot.size_bytes,
+        )
     mission.last_checked_at = now
     db.session.commit()
     return mission
@@ -231,7 +267,17 @@ def claim_ready_mission():
         )
     )
     db.session.commit()
-    return db.session.get(ImageCompressionMission, candidate.id) if claimed == 1 else None
+    if claimed != 1:
+        return None
+    mission = db.session.get(ImageCompressionMission, candidate.id)
+    if mission is not None:
+        logger.info(
+            "领取图片压缩任务 | mission_id=%s | source=%s | attempt=%s",
+            mission.id,
+            mission.source_name,
+            mission.attempts,
+        )
+    return mission
 
 
 def _retry_assets_are_safe(service, mission):
@@ -317,7 +363,13 @@ def claim_retryable_format_failure(service):
         )
         db.session.commit()
         if claimed == 1:
-            return db.session.get(ImageCompressionMission, candidate.id)
+            mission = db.session.get(ImageCompressionMission, candidate.id)
+            if mission is not None:
+                logger.info(
+                    "领取图片历史重试任务 | mission_id=%s",
+                    mission.id,
+                )
+            return mission
     return None
 
 
@@ -332,15 +384,33 @@ def _expected_manifest(mission):
 
 
 def _complete_cleanup(service, mission):
+    logger.info(
+        "开始完成图片任务清理 | mission_id=%s | source=%s",
+        mission.id,
+        mission.source_name,
+    )
     expected = _expected_manifest(mission)
     service.validate_path(mission.output_path, expected)
     service.cleanup_completed(mission.id)
     mission.status = ImageCompressionStatus.COMPLETED
     mission.error_message = None
     db.session.commit()
+    logger.info(
+        "图片任务完成 | mission_id=%s | source=%s | file_count=%s | "
+        "output_bytes=%s",
+        mission.id,
+        mission.source_name,
+        expected.file_count,
+        expected.size_bytes,
+    )
 
 
 def _recover_publishing(service, mission):
+    logger.info(
+        "恢复图片任务发布阶段 | mission_id=%s | source=%s",
+        mission.id,
+        mission.source_name,
+    )
     expected = _expected_manifest(mission)
     plan = service.recover_publish_plan(
         mission.id,
@@ -352,18 +422,40 @@ def _recover_publishing(service, mission):
     mission.status = ImageCompressionStatus.CLEANUP_PENDING
     mission.error_message = None
     db.session.commit()
+    logger.info(
+        "图片批次已发布，进入清理阶段 | mission_id=%s | source=%s | recovery=true",
+        mission.id,
+        mission.source_name,
+    )
     _complete_cleanup(service, mission)
 
 
 def process_mission(service, mission):
     mission_id = mission.id
     source_name = mission.source_name
+    started_at = time.monotonic()
+    logger.info(
+        "开始推进图片任务 | mission_id=%s | source=%s | status=%s",
+        mission_id,
+        source_name,
+        mission.status,
+    )
     try:
         if mission.status == ImageCompressionStatus.MOVING:
+            logger.info(
+                "开始接管图片来源 | mission_id=%s | source=%s",
+                mission_id,
+                source_name,
+            )
             service.ensure_ingested(mission.source_path, mission.id)
             mission.status = ImageCompressionStatus.PROCESSING
             mission.error_message = None
             db.session.commit()
+            logger.info(
+                "图片来源接管完成，进入处理阶段 | mission_id=%s | source=%s",
+                mission_id,
+                source_name,
+            )
 
         if mission.status == ImageCompressionStatus.PROCESSING:
             service.ensure_ingested(mission.source_path, mission.id)
@@ -380,10 +472,29 @@ def process_mission(service, mission):
             mission.output_size_bytes = publish_plan.manifest.size_bytes
             mission.status = ImageCompressionStatus.PUBLISHING
             db.session.commit()
+            logger.info(
+                "图片批次准备完成，进入发布阶段 | mission_id=%s | source=%s | "
+                "file_count=%s | output_bytes=%s",
+                mission_id,
+                source_name,
+                publish_plan.manifest.file_count,
+                publish_plan.manifest.size_bytes,
+            )
             service.publish(publish_plan)
             mission.status = ImageCompressionStatus.CLEANUP_PENDING
             db.session.commit()
+            logger.info(
+                "图片批次已发布，进入清理阶段 | mission_id=%s | source=%s",
+                mission_id,
+                source_name,
+            )
             _complete_cleanup(service, mission)
+            logger.info(
+                "图片任务本轮处理结束 | mission_id=%s | source=%s | elapsed=%.3fs",
+                mission_id,
+                source_name,
+                time.monotonic() - started_at,
+            )
             return publish_plan.destination
 
         if mission.status == ImageCompressionStatus.PUBLISHING:
@@ -391,6 +502,11 @@ def process_mission(service, mission):
             return Path(mission.output_path)
 
         if mission.status == ImageCompressionStatus.CLEANUP_PENDING:
+            logger.info(
+                "恢复图片任务清理阶段 | mission_id=%s | source=%s",
+                mission_id,
+                source_name,
+            )
             _complete_cleanup(service, mission)
             return Path(mission.output_path)
         return None
@@ -504,6 +620,8 @@ def process_images():
             with image_compression_lock(db.engine) as acquired:
                 if acquired:
                     process_one_mission()
+                else:
+                    logger.info("图片定时任务跳过：另一进程正在处理")
     except Exception as error:
         log_exception(logger, "图片定时任务未处理异常", error)
         try:

@@ -1,6 +1,8 @@
 import json
+import logging
 import os
 import shutil
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +12,9 @@ from .compressor import ImageProcessor
 from .manifest import ContentManifest, content_manifest, iter_regular_files
 from .naming import NameCandidate, allocate_names
 from .policy import is_archive_name
+
+
+logger = logging.getLogger(__name__)
 
 
 class ImagePipelineError(RuntimeError):
@@ -168,6 +173,11 @@ class ImageCompressionService:
         quarantine = self.quarantine_path(mission_id)
 
         if staged_source.exists():
+            logger.info(
+                "检查已接管的图片来源 | mission_id=%s | source=%s",
+                mission_id,
+                source_path.name,
+            )
             staged_manifest = content_manifest(staged_source)
             marker = self._read_ingest_marker(mission_directory)
             if marker is not None and marker != staged_manifest:
@@ -178,6 +188,14 @@ class ImageCompressionService:
                 self._remove_exact(quarantine, self.source_directory)
             if marker is None:
                 self._write_ingest_marker(mission_directory, staged_manifest)
+            logger.info(
+                "图片来源接管状态有效 | mission_id=%s | source=%s | "
+                "file_count=%s | size_bytes=%s",
+                mission_id,
+                source_path.name,
+                staged_manifest.file_count,
+                staged_manifest.size_bytes,
+            )
             return staged_source
 
         if partial_source.exists():
@@ -187,6 +205,11 @@ class ImageCompressionService:
                 raise ImagePipelineError("Source disappeared before it could be moved")
             source_path.rename(quarantine)
 
+        logger.info(
+            "开始接管图片来源 | mission_id=%s | source=%s",
+            mission_id,
+            source_path.name,
+        )
         quarantine_manifest = content_manifest(quarantine)
         self._copy_path(quarantine, partial_source)
         quarantine_after_copy = content_manifest(quarantine)
@@ -199,6 +222,14 @@ class ImageCompressionService:
         partial_source.rename(staged_source)
         self._write_ingest_marker(mission_directory, partial_manifest)
         self._remove_exact(quarantine, self.source_directory)
+        logger.info(
+            "图片来源接管完成 | mission_id=%s | source=%s | "
+            "file_count=%s | size_bytes=%s",
+            mission_id,
+            source_path.name,
+            partial_manifest.file_count,
+            partial_manifest.size_bytes,
+        )
         return staged_source
 
     def _reset_processing_paths(self, mission_id):
@@ -246,15 +277,42 @@ class ImageCompressionService:
             archive_path, provenance, depth = archive_queue.popleft()
             archive_number += 1
             extraction_directory = unpack_root / f"{archive_number:08d}"
-            for relative, path in self.archive_extractor.extract(
+            logger.info(
+                "开始解包图片批次 | mission_id=%s | archive=%s | "
+                "archive_index=%s | depth=%s",
+                mission_id,
+                archive_path.name,
+                archive_number,
+                depth,
+            )
+            extracted = self.archive_extractor.extract(
                 archive_path, extraction_directory, depth, budget
-            ):
+            )
+            logger.info(
+                "图片批次解包完成 | mission_id=%s | archive=%s | "
+                "archive_index=%s | member_count=%s | expanded_bytes=%s",
+                mission_id,
+                archive_path.name,
+                archive_number,
+                len(extracted),
+                budget.expanded_bytes,
+            )
+            for relative, path in extracted:
                 member_provenance = f"{provenance}!/{relative.as_posix()}"
                 if is_archive_name(path.name):
                     archive_queue.append((path, member_provenance, depth + 1))
                 else:
                     add_leaf(path, member_provenance)
-        return sorted(leaves, key=self._leaf_sort_key)
+        sorted_leaves = sorted(leaves, key=self._leaf_sort_key)
+        logger.info(
+            "图片批次文件收集完成 | mission_id=%s | source=%s | "
+            "file_count=%s | archive_count=%s",
+            mission_id,
+            source_name,
+            len(sorted_leaves),
+            archive_number,
+        )
+        return sorted_leaves
 
     def prepare_batch(
         self, mission_id, source_kind, source_name, destination_key
@@ -275,8 +333,47 @@ class ImageCompressionService:
         )
         result_path = mission_directory / "result"
         result_path.mkdir()
-        for leaf in leaves:
-            self.image_processor.process(leaf.path, result_path / names[leaf.key])
+        total_files = len(leaves)
+        logger.info(
+            "开始处理图片批次 | mission_id=%s | source=%s | "
+            "source_kind=%s | total_files=%s",
+            mission_id,
+            source_name,
+            source_kind,
+            total_files,
+        )
+        for index, leaf in enumerate(leaves, start=1):
+            destination_name = names[leaf.key]
+            destination = result_path / destination_name
+            source_size = leaf.path.stat().st_size
+            started_at = time.monotonic()
+            logger.info(
+                "开始处理批次文件 | mission_id=%s | progress=%s/%s | "
+                "percent=%s%% | source=%s | output=%s | source_bytes=%s",
+                mission_id,
+                index,
+                total_files,
+                (index - 1) * 100 // total_files,
+                leaf.path.name,
+                destination_name,
+                source_size,
+            )
+            compressed = self.image_processor.process(leaf.path, destination)
+            logger.info(
+                "批次文件处理完成 | mission_id=%s | progress=%s/%s | "
+                "percent=%s%% | source=%s | output=%s | action=%s | "
+                "source_bytes=%s | output_bytes=%s | elapsed=%.3fs",
+                mission_id,
+                index,
+                total_files,
+                index * 100 // total_files,
+                leaf.path.name,
+                destination_name,
+                "compressed" if compressed else "copied",
+                source_size,
+                destination.stat().st_size,
+                time.monotonic() - started_at,
+            )
 
         is_directory = source_kind in {"directory", "archive"}
         if is_directory:
@@ -289,6 +386,14 @@ class ImageCompressionService:
         if manifest.file_count != len(leaves):
             raise ImagePipelineError("Result file count does not match the source batch")
         destination = self.output_directory / destination_key
+        logger.info(
+            "图片批次处理完成 | mission_id=%s | source=%s | "
+            "file_count=%s | output_bytes=%s",
+            mission_id,
+            source_name,
+            manifest.file_count,
+            manifest.size_bytes,
+        )
         return PreparedBatch(result_path, destination, is_directory, manifest)
 
     def stage_for_publish(self, mission_id, prepared):
@@ -303,6 +408,12 @@ class ImageCompressionService:
                 f"Output already exists: {destination.name}"
             )
 
+        logger.info(
+            "开始暂存图片批次成品 | mission_id=%s | output=%s | file_count=%s",
+            mission_id,
+            destination.name,
+            prepared.manifest.file_count,
+        )
         if prepared.is_directory:
             self._copy_path(prepared.result_path, staging)
         else:
@@ -313,6 +424,12 @@ class ImageCompressionService:
         staged_manifest = content_manifest(staging)
         if staged_manifest != prepared.manifest:
             raise ImagePipelineError("Published staging copy does not match the result")
+        logger.info(
+            "图片批次成品暂存完成 | mission_id=%s | output=%s | size_bytes=%s",
+            mission_id,
+            destination.name,
+            staged_manifest.size_bytes,
+        )
         return PublishPlan(
             staging, destination, prepared.is_directory, prepared.manifest
         )
@@ -333,12 +450,29 @@ class ImageCompressionService:
         )
         if destination.exists():
             self.validate_path(destination, plan.manifest)
+            logger.info(
+                "图片批次成品已存在且验证通过 | output=%s | file_count=%s",
+                destination.name,
+                plan.manifest.file_count,
+            )
             return destination
         if not staging_path.exists():
             raise ImagePipelineError("Validated publish staging path is missing")
         self.validate_path(staging_path, plan.manifest)
+        logger.info(
+            "开始发布图片批次 | output=%s | file_count=%s | size_bytes=%s",
+            destination.name,
+            plan.manifest.file_count,
+            plan.manifest.size_bytes,
+        )
         staging_path.rename(destination)
         self.validate_path(destination, plan.manifest)
+        logger.info(
+            "图片批次发布完成 | output=%s | file_count=%s | size_bytes=%s",
+            destination.name,
+            plan.manifest.file_count,
+            plan.manifest.size_bytes,
+        )
         return destination
 
     def recover_publish_plan(
@@ -352,12 +486,14 @@ class ImageCompressionService:
         )
 
     def cleanup_completed(self, mission_id):
+        logger.info("开始清理图片任务暂存数据 | mission_id=%s", mission_id)
         mission_directory = self.mission_directory(mission_id)
         if mission_directory.exists():
             self._remove_exact(mission_directory, self.pending_root)
         staging = self.publish_staging_path(mission_id)
         if staging.exists():
             self._remove_exact(staging, self.output_directory)
+        logger.info("图片任务暂存数据清理完成 | mission_id=%s", mission_id)
 
     def discard_publish_staging(self, mission_id):
         staging = self.publish_staging_path(mission_id)
