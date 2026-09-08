@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import logging
 from pathlib import Path
+import time
 
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert
@@ -69,6 +70,11 @@ def refresh_missions(source_directory):
         stat = path.stat()
         source_path = str(path)
         if insert_mission_if_missing(db.session, path, stat):
+            logger.info(
+                "发现新视频，等待文件稳定 | source=%s | size_bytes=%s",
+                path.name,
+                stat.st_size,
+            )
             continue
         mission = CompressionMission.query.filter_by(source_path=source_path).first()
         if mission is None:
@@ -81,6 +87,12 @@ def refresh_missions(source_directory):
             mission.status = CompressionStatus.WAITING_STABLE
             mission.output_path = None
             mission.error_message = None
+            logger.info(
+                "已完成的视频重新出现，重新等待稳定 | mission_id=%s | source=%s | size_bytes=%s",
+                mission.id,
+                path.name,
+                stat.st_size,
+            )
             continue
         if mission.status not in {
             CompressionStatus.WAITING_STABLE,
@@ -93,12 +105,24 @@ def refresh_missions(source_directory):
                 mission.stable_checks += 1
                 if mission.stable_checks >= 1:
                     mission.status = CompressionStatus.READY
+                    logger.info(
+                        "视频文件已稳定，进入待处理队列 | mission_id=%s | source=%s | size_bytes=%s",
+                        mission.id,
+                        path.name,
+                        stat.st_size,
+                    )
         else:
             mission.size_bytes = stat.st_size
             mission.modified_ns = stat.st_mtime_ns
             mission.stable_checks = 0
             mission.status = CompressionStatus.WAITING_STABLE
             mission.error_message = None
+            logger.info(
+                "视频文件仍在变化，继续等待稳定 | mission_id=%s | source=%s | size_bytes=%s",
+                mission.id,
+                path.name,
+                stat.st_size,
+            )
     db.session.commit()
 
 
@@ -132,7 +156,17 @@ def claim_next_mission(service):
         )
     )
     db.session.commit()
-    return db.session.get(CompressionMission, candidate.id) if claimed == 1 else None
+    if claimed != 1:
+        return None
+    mission = db.session.get(CompressionMission, candidate.id)
+    if mission is not None:
+        logger.info(
+            "领取视频压缩任务 | mission_id=%s | source=%s | attempt=%s",
+            mission.id,
+            mission.file_name,
+            mission.attempts,
+        )
+    return mission
 
 
 def mission_paths(mission, service, source_directory):
@@ -213,6 +247,11 @@ def finish_cleanup_pending(service, source_directory):
     )
     if mission is None:
         return False
+    logger.info(
+        "恢复视频清理阶段 | mission_id=%s | source=%s",
+        mission.id,
+        mission.file_name,
+    )
     try:
         source, output, staging, _ = mission_paths(
             mission, service, source_directory
@@ -237,6 +276,11 @@ def finish_cleanup_pending(service, source_directory):
     mission.output_path = str(output)
     mission.error_message = None
     db.session.commit()
+    logger.info(
+        "视频任务完成 | mission_id=%s | source=%s | recovery=cleanup",
+        mission.id,
+        mission.file_name,
+    )
     return True
 
 
@@ -248,6 +292,12 @@ def recover_validating_mission(service, source_directory):
     )
     if mission is None:
         return False
+
+    logger.info(
+        "恢复视频验证/发布阶段 | mission_id=%s | source=%s",
+        mission.id,
+        mission.file_name,
+    )
 
     try:
         source, output, staging, _ = mission_paths(
@@ -273,6 +323,11 @@ def recover_validating_mission(service, source_directory):
             mission.output_path = str(output)
             mission.error_message = None
             db.session.commit()
+            logger.info(
+                "视频任务完成 | mission_id=%s | source=%s | recovery=validating",
+                mission.id,
+                mission.file_name,
+            )
             return True
 
         if not staging_exists:
@@ -285,6 +340,11 @@ def recover_validating_mission(service, source_directory):
             mission.output_path = str(output)
             mission.error_message = "Recovered interrupted validation; retry queued."
             db.session.commit()
+            logger.info(
+                "验证阶段缺少暂存文件，任务重新排队 | mission_id=%s | source=%s",
+                mission.id,
+                mission.file_name,
+            )
             return True
 
         if output_exists:
@@ -300,6 +360,11 @@ def recover_validating_mission(service, source_directory):
         mission.output_path = str(output)
         mission.error_message = None
         db.session.commit()
+        logger.info(
+            "视频已发布，等待清理源文件 | mission_id=%s | source=%s | recovery=validating",
+            mission.id,
+            mission.file_name,
+        )
         service.discard_staging_file(mission.id, output)
         service.discard_work_file(mission.id)
     except (OSError, RuntimeError, ValueError) as error:
@@ -316,6 +381,12 @@ def recover_processing_mission(service, source_directory):
     if mission is None:
         return False
 
+    logger.info(
+        "恢复视频处理阶段 | mission_id=%s | source=%s",
+        mission.id,
+        mission.file_name,
+    )
+
     try:
         source, output, staging, _ = mission_paths(
             mission, service, source_directory
@@ -340,6 +411,11 @@ def recover_processing_mission(service, source_directory):
             mission.output_path = str(output)
             mission.error_message = None
             db.session.commit()
+            logger.info(
+                "视频任务完成 | mission_id=%s | source=%s | recovery=processing",
+                mission.id,
+                mission.file_name,
+            )
             return True
 
         if output_exists:
@@ -354,6 +430,11 @@ def recover_processing_mission(service, source_directory):
             db.session.commit()
             service.discard_staging_file(mission.id, output)
             service.discard_work_file(mission.id)
+            logger.info(
+                "已恢复发布结果，等待清理源文件 | mission_id=%s | source=%s",
+                mission.id,
+                mission.file_name,
+            )
             return True
 
         if staging_exists:
@@ -374,6 +455,11 @@ def recover_processing_mission(service, source_directory):
                     "Recovered interrupted processing; retry queued."
                 )
                 db.session.commit()
+                logger.info(
+                    "处理阶段暂存文件无效，任务重新排队 | mission_id=%s | source=%s",
+                    mission.id,
+                    mission.file_name,
+                )
                 return True
 
             service.discard_work_file(mission.id)
@@ -381,6 +467,11 @@ def recover_processing_mission(service, source_directory):
             mission.output_path = str(output)
             mission.error_message = None
             db.session.commit()
+            logger.info(
+                "已恢复有效暂存文件，进入验证/发布阶段 | mission_id=%s | source=%s",
+                mission.id,
+                mission.file_name,
+            )
             return True
 
         service.discard_work_file(mission.id)
@@ -388,6 +479,11 @@ def recover_processing_mission(service, source_directory):
         mission.output_path = str(output)
         mission.error_message = "Recovered interrupted processing; retry queued."
         db.session.commit()
+        logger.info(
+            "处理阶段无可恢复成品，任务重新排队 | mission_id=%s | source=%s",
+            mission.id,
+            mission.file_name,
+        )
     except (OSError, RuntimeError, ValueError) as error:
         fail_mission(mission, error)
     return True
@@ -413,6 +509,13 @@ def process_one_mission():
         return None
 
     mission_id = mission.id
+    source_name = mission.file_name
+    started_at = time.monotonic()
+    logger.info(
+        "开始处理视频任务 | mission_id=%s | source=%s",
+        mission_id,
+        source_name,
+    )
     output = None
     try:
         source, output, _, _ = mission_paths(mission, service, source_dir)
@@ -464,6 +567,12 @@ def process_one_mission():
     mission.output_path = str(prepared.destination)
     mission.error_message = None
     db.session.commit()
+    logger.info(
+        "视频准备完成，进入验证/发布阶段 | mission_id=%s | source=%s | transcoded=%s",
+        mission_id,
+        source_name,
+        prepared.transcoded,
+    )
 
     try:
         service.publish_prepared(mission.id, prepared.destination)
@@ -475,6 +584,11 @@ def process_one_mission():
     mission.output_path = str(prepared.destination)
     mission.error_message = None
     db.session.commit()
+    logger.info(
+        "视频已发布，开始清理源文件 | mission_id=%s | source=%s",
+        mission_id,
+        source_name,
+    )
 
     try:
         service.discard_staging_file(mission.id, prepared.destination)
@@ -487,6 +601,13 @@ def process_one_mission():
     mission.status = CompressionStatus.COMPLETED
     mission.error_message = None
     db.session.commit()
+    logger.info(
+        "视频任务完成 | mission_id=%s | source=%s | transcoded=%s | elapsed=%.1fs",
+        mission_id,
+        source_name,
+        prepared.transcoded,
+        time.monotonic() - started_at,
+    )
     return prepared
 
 
@@ -504,6 +625,8 @@ def compress_videos():
             with video_compression_lock(db.engine) as acquired:
                 if acquired:
                     process_one_mission()
+                else:
+                    logger.info("视频定时任务跳过：另一进程正在处理")
     except Exception as error:
         log_exception(logger, "视频定时任务未处理异常", error)
         try:

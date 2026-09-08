@@ -133,7 +133,13 @@ class RecoverablePublishingTests(unittest.TestCase):
 
             with patch(
                 "video_compression.service.probe_video",
-                return_value=SimpleNamespace(),
+                return_value=SimpleNamespace(
+                    codec_name="hevc",
+                    display_width=1920,
+                    display_height=1080,
+                    fps=30.0,
+                    bit_rate=4_500_000,
+                ),
             ), patch(
                 "video_compression.service.make_plan",
                 return_value=SimpleNamespace(transcode=False),

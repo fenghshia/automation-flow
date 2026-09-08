@@ -1,4 +1,5 @@
 import os
+import logging
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -7,6 +8,9 @@ from pathlib import Path
 from .policy import make_plan, validate_specification
 from .probe import probe_video, verify_decodable
 from .transcoder import transcode
+
+
+logger = logging.getLogger(__name__)
 
 
 class CompressionError(RuntimeError):
@@ -42,12 +46,22 @@ class CompressionService:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def validate_output(self, path):
+        logger.info("开始验证视频 | file=%s", Path(path).name)
         info = probe_video(path, self.ffprobe_path)
         errors = validate_specification(info)
         if errors:
             raise CompressionError("Output validation failed: " + "; ".join(errors))
         duration = info.duration or 0
         verify_decodable(path, self.ffmpeg_path, timeout=max(120, int(duration * 2 + 60)))
+        logger.info(
+            "视频验证通过 | file=%s | codec=%s | size=%sx%s | fps=%.3f | bitrate=%s",
+            Path(path).name,
+            info.codec_name,
+            info.display_width,
+            info.display_height,
+            info.fps,
+            info.bit_rate if info.bit_rate is not None else "unknown",
+        )
         return info
 
     @staticmethod
@@ -136,9 +150,32 @@ class CompressionService:
 
         source_info = probe_video(source, self.ffprobe_path)
         plan = make_plan(source_info)
+        logger.info(
+            "视频分析完成 | mission_id=%s | source=%s | codec=%s | "
+            "size=%sx%s | fps=%.3f | bitrate=%s | action=%s | reasons=%s",
+            mission_id,
+            source.name,
+            source_info.codec_name,
+            source_info.display_width,
+            source_info.display_height,
+            source_info.fps,
+            source_info.bit_rate if source_info.bit_rate is not None else "unknown",
+            "transcode" if plan.transcode else "copy",
+            "; ".join(plan.reasons) if plan.reasons else "already compliant",
+        )
         if not plan.transcode:
             self.validate_output(source)
+            logger.info(
+                "源视频符合规格，开始复制到暂存区 | mission_id=%s | source=%s",
+                mission_id,
+                source.name,
+            )
             self._copy_without_overwrite(source, staging)
+            logger.info(
+                "视频暂存完成 | mission_id=%s | source=%s | transcoded=false",
+                mission_id,
+                source.name,
+            )
             return PreparedCompression(
                 destination=destination,
                 staging=staging,
@@ -147,15 +184,36 @@ class CompressionService:
 
         try:
             duration = source_info.duration or 0
+            timeout = max(900, int(duration * 10 + 300))
+            logger.info(
+                "开始视频转码 | mission_id=%s | source=%s | target=%sx%s | cap_fps=%s | timeout=%ss",
+                mission_id,
+                source.name,
+                plan.width,
+                plan.height,
+                plan.cap_fps,
+                timeout,
+            )
             transcode(
                 self.ffmpeg_path,
                 source,
                 work,
                 plan,
-                timeout=max(900, int(duration * 10 + 300)),
+                timeout=timeout,
+                duration=duration,
             )
             self.validate_output(work)
+            logger.info(
+                "转码成品验证通过，开始复制到暂存区 | mission_id=%s | source=%s",
+                mission_id,
+                source.name,
+            )
             self._copy_without_overwrite(work, staging)
+            logger.info(
+                "视频暂存完成 | mission_id=%s | source=%s | transcoded=true",
+                mission_id,
+                source.name,
+            )
             return PreparedCompression(
                 destination=destination,
                 staging=staging,
@@ -173,8 +231,18 @@ class CompressionService:
         staging = self.staging_path_for(mission_id, destination)
         if not staging.is_file():
             raise CompressionError("Mission staging file does not exist")
+        logger.info(
+            "开始发布视频 | mission_id=%s | file=%s",
+            mission_id,
+            destination.name,
+        )
         self.validate_output(staging)
         os.link(staging, destination)
+        logger.info(
+            "视频发布完成 | mission_id=%s | file=%s",
+            mission_id,
+            destination.name,
+        )
         return staging
 
     def _publish_and_remove_source(
@@ -223,6 +291,7 @@ class CompressionService:
                 temporary,
                 plan,
                 timeout=max(900, int(duration * 10 + 300)),
+                duration=duration,
             )
             self.validate_output(temporary)
             self._publish_and_remove_source(
