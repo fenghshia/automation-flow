@@ -1,4 +1,6 @@
+import os
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +41,20 @@ class NestedArchiveExtractor:
         leaf.parent.mkdir()
         leaf.write_bytes(b"third")
         return [(Path("c/pic.txt"), leaf)]
+
+
+class MacMetadataArchiveExtractor:
+    def extract(self, archive_path, destination, depth, budget):
+        destination.mkdir(parents=True)
+        metadata = destination / "__MACOSX" / "._photo.jpg"
+        photo = destination / "photo.jpg"
+        metadata.parent.mkdir()
+        metadata.write_bytes(b"metadata")
+        photo.write_bytes(b"photo")
+        return [
+            (Path("__MACOSX/._photo.jpg"), metadata),
+            (Path("photo.jpg"), photo),
+        ]
 
 
 class ServiceLifecycleTests(unittest.TestCase):
@@ -105,6 +121,23 @@ class ServiceLifecycleTests(unittest.TestCase):
                 {path.name for path in prepared.result_path.iterdir()},
             )
 
+    def test_archive_macos_metadata_is_not_processed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.make_service(root, extractor=MacMetadataArchiveExtractor())
+            source = service.source_directory / "photos.zip"
+            source.write_bytes(b"archive")
+            service.ensure_ingested(source, 12)
+
+            prepared = service.prepare_batch(12, "archive", "photos.zip", "photos")
+
+            self.assertEqual(
+                ["photo.jpg"], [path.name for path in service.image_processor.sources]
+            )
+            self.assertEqual(
+                ["photo.jpg"], [path.name for path in prepared.result_path.iterdir()]
+            )
+
     def test_prepare_batch_logs_each_file_progress(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -140,6 +173,25 @@ class ServiceLifecycleTests(unittest.TestCase):
 
             self.assertEqual(b"note", published.read_bytes())
             self.assertFalse(service.mission_directory(7).exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only semantics are required")
+    def test_cleanup_removes_readonly_pending_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.make_service(root)
+            mission_directory = service.mission_directory(13)
+            mission_directory.mkdir()
+            readonly = mission_directory / "readonly.png"
+            readonly.write_bytes(b"image")
+            readonly.chmod(stat.S_IREAD)
+
+            try:
+                service.cleanup_completed(13)
+            finally:
+                if readonly.exists():
+                    readonly.chmod(stat.S_IWRITE)
+
+            self.assertFalse(mission_directory.exists())
 
     def test_loose_file_keeps_its_extension_during_processing(self):
         with tempfile.TemporaryDirectory() as directory:

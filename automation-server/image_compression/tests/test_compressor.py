@@ -1,11 +1,32 @@
 import importlib.util
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 
-from image_compression.compressor import ImageCompressionError, ImageProcessor
+from image_compression.compressor import ImageCompressionError, ImageProcessor, copy_verified
 from image_compression.policy import MAX_IMAGE_BYTES
+
+
+@unittest.skipUnless(os.name == "nt", "Windows read-only semantics are required")
+class WindowsCopyTests(unittest.TestCase):
+    def test_copy_does_not_propagate_readonly_attribute(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.png"
+            destination = root / "destination.png"
+            source.write_bytes(b"image")
+            source.chmod(stat.S_IREAD)
+
+            try:
+                copy_verified(source, destination)
+            finally:
+                source.chmod(stat.S_IWRITE)
+
+            self.assertFalse(
+                destination.stat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY
+            )
 
 
 @unittest.skipUnless(importlib.util.find_spec("PIL"), "Pillow is not installed")

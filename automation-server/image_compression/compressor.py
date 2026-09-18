@@ -37,7 +37,7 @@ def copy_verified(source, destination):
     source = Path(source)
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
+    shutil.copyfile(source, destination)
     if source.stat().st_size != destination.stat().st_size:
         raise ImageCompressionError("Copied file size does not match the source")
     if file_sha256(source) != file_sha256(destination):

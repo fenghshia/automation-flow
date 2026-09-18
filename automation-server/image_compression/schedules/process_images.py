@@ -609,7 +609,7 @@ def process_one_mission():
 @scheduler.task(
     "interval",
     id="image_compression_process_one",
-    seconds=10,
+    seconds=STABILITY_INTERVAL_SECONDS,
     max_instances=1,
     coalesce=True,
     misfire_grace_time=120,

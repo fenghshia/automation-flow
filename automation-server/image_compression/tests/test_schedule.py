@@ -155,7 +155,9 @@ class SchedulerTests(unittest.TestCase):
         session = MagicMock()
         session.get.return_value = mission
 
-        with patch.object(schedule_module.db, "session", session), patch("builtins.print"):
+        with patch.object(schedule_module.db, "session", session), patch.object(
+            schedule_module, "log_exception"
+        ), patch("builtins.print"):
             result = schedule_module.process_mission(service, mission)
 
         self.assertIsNone(result)

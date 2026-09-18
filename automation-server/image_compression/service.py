@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -115,9 +116,34 @@ class ImageCompressionService:
         if path.is_symlink():
             path.unlink(missing_ok=True)
         elif path.is_dir():
-            shutil.rmtree(path)
+            shutil.rmtree(path, onerror=ImageCompressionService._retry_readonly_removal)
         else:
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except PermissionError:
+                path.chmod(path.stat().st_mode | stat.S_IWRITE)
+                path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _retry_readonly_removal(function, path, exc_info):
+        error = exc_info[1]
+        candidate = Path(path)
+        is_junction = hasattr(os.path, "isjunction") and os.path.isjunction(candidate)
+        if (
+            not isinstance(error, PermissionError)
+            or candidate.is_symlink()
+            or is_junction
+        ):
+            raise error
+        candidate.chmod(candidate.stat().st_mode | stat.S_IWRITE)
+        function(path)
+
+    @staticmethod
+    def _is_macos_metadata(path):
+        return any(
+            part.casefold() == "__macosx" or part.startswith("._")
+            for part in Path(path).parts
+        )
 
     @staticmethod
     def _copy_path(source, destination):
@@ -255,6 +281,9 @@ class ImageCompressionService:
 
         if source_kind == "directory":
             for relative, path in iter_regular_files(staged_source):
+                if self._is_macos_metadata(relative):
+                    logger.info("跳过 macOS 元数据文件 | source=%s", relative.as_posix())
+                    continue
                 provenance = f"{source_name}/{relative.as_posix()}"
                 if is_archive_name(path.name):
                     archive_queue.append((path, provenance, 1))
@@ -298,6 +327,9 @@ class ImageCompressionService:
                 budget.expanded_bytes,
             )
             for relative, path in extracted:
+                if self._is_macos_metadata(relative):
+                    logger.info("跳过 macOS 元数据文件 | source=%s", relative.as_posix())
+                    continue
                 member_provenance = f"{provenance}!/{relative.as_posix()}"
                 if is_archive_name(path.name):
                     archive_queue.append((path, member_provenance, depth + 1))
