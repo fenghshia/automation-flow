@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import logging_config
+from env import EnvConfig
 
 
 class PipelineError(RuntimeError):
@@ -137,6 +138,22 @@ class LoggingConfigurationTests(unittest.TestCase):
             self.assertIn(expected, error_log)
         self.assertNotIn(marker, self.read("logs/error.log"))
 
+    def test_log_exception_reports_business_caller_line(self):
+        expected_line = None
+        try:
+            raise RuntimeError("caller-line-marker")
+        except RuntimeError as error:
+            expected_line = sys._getframe().f_lineno + 1
+            logging_config.log_exception(
+                logging.getLogger("image_compression.worker"),
+                "business boundary",
+                error,
+            )
+
+        contents = self.read("image_compression/logs/error.log")
+        self.assertIn(f"image_compression.worker:{expected_line}", contents)
+        self.assertIn("caller-line-marker", contents)
+
     def test_configuration_is_idempotent_and_does_not_duplicate_records(self):
         marker = "idempotence-marker"
         before = len(logging.getLogger("image_compression").handlers)
@@ -177,6 +194,18 @@ class LoggingConfigurationTests(unittest.TestCase):
         for raw_value in (secret, "plain-secret", "abc.def", "user:pass"):
             self.assertNotIn(raw_value, contents)
         self.assertIn("<redacted>", contents)
+
+    def test_image_project_paths_are_not_registered_for_redaction(self):
+        configured = set(EnvConfig._logging_redaction_variables)
+        self.assertTrue(
+            {
+                "IMAGE_COMPRESSION_SOURCE_DIR",
+                "IMAGE_COMPRESSION_OUTPUT_DIR",
+                "IMAGE_COMPRESSION_7ZIP_BIN_DIR",
+            }.isdisjoint(configured)
+        )
+        self.assertIn("DB_PASSWORD", configured)
+        self.assertIn("GEMINI_API_KEY", configured)
 
     def test_one_file_sink_failure_does_not_break_business_logging(self):
         marker = "resilient-handler-marker"

@@ -39,6 +39,7 @@ class ImageCompressionMission(db.Model):
     output_manifest_sha256 = db.Column(db.String(64), nullable=True)
     output_file_count = db.Column(db.Integer, nullable=True)
     output_size_bytes = db.Column(db.BigInteger, nullable=True)
+    error_code = db.Column(db.String(64), nullable=True, index=True)
     error_message = db.Column(db.Text, nullable=True)
     last_checked_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     processing_started_at = db.Column(db.DateTime, nullable=True)
@@ -46,4 +47,3 @@ class ImageCompressionMission(db.Model):
     updated_at = db.Column(
         db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
     )
-

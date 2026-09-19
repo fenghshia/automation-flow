@@ -366,6 +366,7 @@ def log_exception(
         message,
         *args,
         exc_info=(type(error), error, error.__traceback__),
+        stacklevel=2,
     )
 
 

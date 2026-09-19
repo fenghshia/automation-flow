@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import shutil
 import stat
@@ -5,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from image_compression.compressor import ImageInspection, ImageProcessor
 from image_compression.manifest import ContentManifest
 from image_compression.service import ImageCompressionService, ImagePipelineError
 
@@ -13,11 +15,36 @@ class CopyingImageProcessor:
     def __init__(self):
         self.sources = []
 
-    def process(self, source, destination):
+    @staticmethod
+    def probe(source):
+        return None
+
+    def process(self, source, destination, inspection=None):
         self.sources.append(Path(source))
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
         return False
+
+
+class MislabeledJpegCopyingProcessor(CopyingImageProcessor):
+    @staticmethod
+    def probe(source):
+        source = Path(source)
+        suffix = source.suffix.casefold()
+        if suffix not in {".jpg", ".png", ".webp"}:
+            return None
+        return ImageInspection(
+            image_format="JPEG",
+            original_suffix=source.suffix,
+            canonical_suffix=".jpg",
+            width=16,
+            height=16,
+            pixel_count=256,
+            animated=False,
+            source_size_bytes=source.stat().st_size,
+            extension_matches=suffix == ".jpg",
+            pixel_warning=False,
+        )
 
 
 class NestedArchiveExtractor:
@@ -58,7 +85,7 @@ class MacMetadataArchiveExtractor:
 
 
 class ServiceLifecycleTests(unittest.TestCase):
-    def make_service(self, root, extractor=None):
+    def make_service(self, root, extractor=None, image_processor=None):
         source = root / "source"
         output = root / "output"
         pending = root / "pending"
@@ -69,7 +96,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             root,
             pending_root=pending,
             archive_extractor=extractor or NestedArchiveExtractor(),
-            image_processor=CopyingImageProcessor(),
+            image_processor=image_processor or CopyingImageProcessor(),
         )
 
     def test_ingest_preserves_verified_pending_copy_and_removes_source(self):
@@ -156,7 +183,30 @@ class ServiceLifecycleTests(unittest.TestCase):
             self.assertIn("progress=2/2", output)
             self.assertIn("percent=100%", output)
             self.assertEqual(2, output.count("批次文件处理完成"))
-            self.assertEqual(2, output.count("action=copied"))
+            self.assertEqual(2, output.count("action=non_image_copy"))
+
+    def test_mislabeled_images_are_renamed_before_collision_allocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            processor = MislabeledJpegCopyingProcessor()
+            service = self.make_service(root, image_processor=processor)
+            source = service.source_directory / "group"
+            (source / "a").mkdir(parents=True)
+            (source / "b").mkdir()
+            (source / "a" / "photo.png").write_bytes(b"jpeg-a")
+            (source / "b" / "photo.jpg").write_bytes(b"jpeg-b")
+            service.ensure_ingested(source, 14)
+
+            with self.assertLogs("image_compression.service", level="WARNING") as logs:
+                prepared = service.prepare_batch(14, "directory", "group", "group")
+
+            self.assertEqual(
+                {"photo.jpg", "D1_photo.jpg"},
+                {path.name for path in prepared.result_path.iterdir()},
+            )
+            output = "\n".join(logs.output)
+            self.assertIn("event=IMAGE_EXTENSION_NORMALIZED", output)
+            self.assertIn("provenance=group/a/photo.png", output)
 
     def test_publish_then_cleanup_removes_only_pending_data(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -204,6 +254,78 @@ class ServiceLifecycleTests(unittest.TestCase):
             service.prepare_batch(10, "file", "photo.jpg", "photo.jpg")
 
             self.assertEqual(".jpg", service.image_processor.sources[0].suffix)
+
+    def test_mislabeled_loose_file_uses_canonical_final_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            processor = MislabeledJpegCopyingProcessor()
+            service = self.make_service(root, image_processor=processor)
+            source = service.source_directory / "photo.png"
+            source.write_bytes(b"jpeg")
+            service.ensure_ingested(source, 15)
+
+            prepared = service.prepare_batch(
+                15, "file", "photo.png", "photo.png"
+            )
+
+            self.assertEqual("photo.jpg", prepared.destination.name)
+            self.assertEqual(
+                ["photo.jpg"], [path.name for path in prepared.result_path.iterdir()]
+            )
+
+    @unittest.skipUnless(importlib.util.find_spec("PIL"), "Pillow is not installed")
+    def test_real_mislabeled_loose_file_publishes_as_jpeg(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.make_service(root, image_processor=ImageProcessor())
+            source = service.source_directory / "photo.png"
+            Image.new("RGB", (16, 16), "red").save(source, format="JPEG")
+            original = source.read_bytes()
+            service.ensure_ingested(source, 16)
+
+            prepared = service.prepare_batch(
+                16, "file", "photo.png", "photo.png"
+            )
+            plan = service.stage_for_publish(16, prepared)
+            published = service.publish(plan)
+
+            self.assertEqual("photo.jpg", published.name)
+            self.assertEqual(original, published.read_bytes())
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("PIL") and importlib.util.find_spec("pyvips"),
+        "Pillow and pyvips are required",
+    )
+    def test_mpo_named_jpg_publishes_as_mpo_without_reencoding(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.make_service(root, image_processor=ImageProcessor())
+            source = service.source_directory / "photo.jpg"
+            frames = [
+                Image.new("RGB", (16, 16), color)
+                for color in ("red", "blue")
+            ]
+            frames[0].save(
+                source,
+                format="MPO",
+                save_all=True,
+                append_images=frames[1:],
+            )
+            original = source.read_bytes()
+            service.ensure_ingested(source, 17)
+
+            prepared = service.prepare_batch(
+                17, "file", "photo.jpg", "photo.jpg"
+            )
+            plan = service.stage_for_publish(17, prepared)
+            published = service.publish(plan)
+
+            self.assertEqual("photo.mpo", published.name)
+            self.assertEqual(original, published.read_bytes())
 
     def test_publish_recovery_accepts_only_matching_final_output(self):
         with tempfile.TemporaryDirectory() as directory:

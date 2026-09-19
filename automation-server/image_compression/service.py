@@ -9,17 +9,48 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .archive import ArchiveBudget, ArchiveExtractor
-from .compressor import ImageProcessor
+from .compressor import ImageInspection, ImageProcessor
 from .manifest import ContentManifest, content_manifest, iter_regular_files
 from .naming import NameCandidate, allocate_names
-from .policy import is_archive_name
+from .policy import MAX_IMAGE_BYTES, PASSTHROUGH_FORMATS, is_archive_name
 
 
 logger = logging.getLogger(__name__)
 
 
 class ImagePipelineError(RuntimeError):
-    pass
+    error_code = "IMAGE_PIPELINE_FAILED"
+
+
+class ImagePipelineFileError(ImagePipelineError):
+    def __init__(
+        self,
+        error,
+        *,
+        mission_id,
+        progress_index,
+        progress_total,
+        source_path,
+        provenance,
+        output_path=None,
+    ):
+        self.error_code = getattr(error, "error_code", None) or (
+            "FILESYSTEM_OPERATION_FAILED"
+            if isinstance(error, OSError)
+            else "IMAGE_PROCESSING_FAILED"
+        )
+        self.mission_id = mission_id
+        self.progress_index = progress_index
+        self.progress_total = progress_total
+        self.source_path = Path(source_path)
+        self.provenance = provenance
+        self.output_path = Path(output_path) if output_path is not None else None
+        super().__init__(
+            f"error_code={self.error_code} | mission_id={mission_id} | "
+            f"progress={progress_index}/{progress_total} | "
+            f"source_path={self.source_path} | provenance={provenance} | "
+            f"output_path={self.output_path or '-'} | error={error}"
+        )
 
 
 @dataclass(frozen=True)
@@ -43,6 +74,16 @@ class LeafFile:
     key: str
     provenance: str
     path: Path
+
+
+@dataclass(frozen=True)
+class PreparedLeaf:
+    key: str
+    provenance: str
+    path: Path
+    source_name: str
+    planned_basename: str
+    inspection: ImageInspection | None
 
 
 class ImageCompressionService:
@@ -269,6 +310,26 @@ class ImageCompressionService:
     def _leaf_sort_key(leaf):
         return (leaf.provenance.casefold(), leaf.provenance)
 
+    @staticmethod
+    def _planned_basename(path, inspection):
+        name = Path(path).name
+        if inspection is None or inspection.extension_matches:
+            return name
+        suffix = Path(name).suffix
+        stem = name[: -len(suffix)] if suffix else name
+        return f"{stem}{inspection.canonical_suffix}"
+
+    @staticmethod
+    def _inspection_values(inspection):
+        if inspection is None:
+            return ("non-image", "-", "-", "-")
+        return (
+            inspection.image_format,
+            f"{inspection.width}x{inspection.height}",
+            inspection.pixel_count,
+            inspection.original_suffix or "<none>",
+        )
+
     def _collect_leaves(self, staged_source, source_kind, source_name, mission_id):
         leaves = []
         archive_queue = deque()
@@ -360,12 +421,39 @@ class ImageCompressionService:
         if not leaves:
             raise ImagePipelineError("The source batch contains no leaf files")
 
+        total_files = len(leaves)
+        prepared_leaves = []
+        for index, leaf in enumerate(leaves, start=1):
+            try:
+                inspection = self.image_processor.probe(leaf.path)
+            except Exception as error:
+                raise ImagePipelineFileError(
+                    error,
+                    mission_id=mission_id,
+                    progress_index=index,
+                    progress_total=total_files,
+                    source_path=leaf.path,
+                    provenance=leaf.provenance,
+                ) from error
+            prepared_leaves.append(
+                PreparedLeaf(
+                    key=leaf.key,
+                    provenance=leaf.provenance,
+                    path=leaf.path,
+                    source_name=leaf.path.name,
+                    planned_basename=self._planned_basename(leaf.path, inspection),
+                    inspection=inspection,
+                )
+            )
+
         names = allocate_names(
-            [NameCandidate(leaf.key, leaf.provenance, leaf.path.name) for leaf in leaves]
+            [
+                NameCandidate(leaf.key, leaf.provenance, leaf.planned_basename)
+                for leaf in prepared_leaves
+            ]
         )
         result_path = mission_directory / "result"
         result_path.mkdir()
-        total_files = len(leaves)
         logger.info(
             "开始处理图片批次 | mission_id=%s | source=%s | "
             "source_kind=%s | total_files=%s",
@@ -374,36 +462,122 @@ class ImageCompressionService:
             source_kind,
             total_files,
         )
-        for index, leaf in enumerate(leaves, start=1):
+        for index, leaf in enumerate(prepared_leaves, start=1):
             destination_name = names[leaf.key]
             destination = result_path / destination_name
             source_size = leaf.path.stat().st_size
+            image_format, dimensions, pixel_count, original_suffix = (
+                self._inspection_values(leaf.inspection)
+            )
+            if leaf.inspection is not None and not leaf.inspection.extension_matches:
+                logger.warning(
+                    "图片扩展名已按实际格式规范化 | "
+                    "event=IMAGE_EXTENSION_NORMALIZED | mission_id=%s | "
+                    "progress=%s/%s | source_path=%s | provenance=%s | "
+                    "original_name=%s | original_suffix=%s | detected_format=%s | "
+                    "dimensions=%s | pixels=%s | source_bytes=%s | planned_output=%s",
+                    mission_id,
+                    index,
+                    total_files,
+                    leaf.path,
+                    leaf.provenance,
+                    leaf.source_name,
+                    original_suffix,
+                    image_format,
+                    dimensions,
+                    pixel_count,
+                    source_size,
+                    destination_name,
+                )
+            if (
+                leaf.inspection is not None
+                and leaf.inspection.pixel_warning
+                and (
+                    source_size <= MAX_IMAGE_BYTES
+                    or leaf.inspection.image_format in PASSTHROUGH_FORMATS
+                )
+            ):
+                logger.warning(
+                    "大像素图片无需完整解码，按字节复制 | "
+                    "event=IMAGE_PIXEL_WARNING_PASSTHROUGH | mission_id=%s | "
+                    "progress=%s/%s | source_path=%s | provenance=%s | "
+                    "format=%s | dimensions=%s | pixels=%s | source_bytes=%s | "
+                    "action=copy_without_full_decode",
+                    mission_id,
+                    index,
+                    total_files,
+                    leaf.path,
+                    leaf.provenance,
+                    image_format,
+                    dimensions,
+                    pixel_count,
+                    source_size,
+                )
             started_at = time.monotonic()
             logger.info(
                 "开始处理批次文件 | mission_id=%s | progress=%s/%s | "
-                "percent=%s%% | source=%s | output=%s | source_bytes=%s",
+                "percent=%s%% | source_path=%s | provenance=%s | source=%s | "
+                "output=%s | source_bytes=%s | detected_format=%s | "
+                "dimensions=%s | pixels=%s",
                 mission_id,
                 index,
                 total_files,
                 (index - 1) * 100 // total_files,
+                leaf.path,
+                leaf.provenance,
                 leaf.path.name,
                 destination_name,
                 source_size,
+                image_format,
+                dimensions,
+                pixel_count,
             )
-            compressed = self.image_processor.process(leaf.path, destination)
+            try:
+                compressed = self.image_processor.process(
+                    leaf.path, destination, leaf.inspection
+                )
+            except Exception as error:
+                raise ImagePipelineFileError(
+                    error,
+                    mission_id=mission_id,
+                    progress_index=index,
+                    progress_total=total_files,
+                    source_path=leaf.path,
+                    provenance=leaf.provenance,
+                    output_path=destination,
+                ) from error
+            action = (
+                "compressed"
+                if compressed
+                else (
+                    "non_image_copy"
+                    if leaf.inspection is None
+                    else (
+                        "normalized_copy"
+                        if not leaf.inspection.extension_matches
+                        else "copied"
+                    )
+                )
+            )
             logger.info(
                 "批次文件处理完成 | mission_id=%s | progress=%s/%s | "
-                "percent=%s%% | source=%s | output=%s | action=%s | "
-                "source_bytes=%s | output_bytes=%s | elapsed=%.3fs",
+                "percent=%s%% | source_path=%s | provenance=%s | source=%s | "
+                "output=%s | action=%s | source_bytes=%s | output_bytes=%s | "
+                "detected_format=%s | dimensions=%s | pixels=%s | elapsed=%.3fs",
                 mission_id,
                 index,
                 total_files,
                 index * 100 // total_files,
+                leaf.path,
+                leaf.provenance,
                 leaf.path.name,
                 destination_name,
-                "compressed" if compressed else "copied",
+                action,
                 source_size,
                 destination.stat().st_size,
+                image_format,
+                dimensions,
+                pixel_count,
                 time.monotonic() - started_at,
             )
 
@@ -415,9 +589,14 @@ class ImageCompressionService:
             if len(result_files) != 1 or not result_files[0].is_file():
                 raise ImagePipelineError("A file mission produced an invalid result")
             manifest = content_manifest(result_files[0])
-        if manifest.file_count != len(leaves):
+        if manifest.file_count != len(prepared_leaves):
             raise ImagePipelineError("Result file count does not match the source batch")
-        destination = self.output_directory / destination_key
+        resolved_destination_key = (
+            names[prepared_leaves[0].key]
+            if source_kind == "file"
+            else destination_key
+        )
+        destination = self.output_directory / resolved_destination_key
         logger.info(
             "图片批次处理完成 | mission_id=%s | source=%s | "
             "file_count=%s | output_bytes=%s",

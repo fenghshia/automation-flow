@@ -15,7 +15,7 @@ from .policy import (
 
 
 class ArchiveError(RuntimeError):
-    pass
+    error_code = "ARCHIVE_PROCESSING_FAILED"
 
 
 class ArchiveLimitError(ArchiveError):

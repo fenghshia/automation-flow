@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 import time
 
-from sqlalchemy import text
+from sqlalchemy import and_, or_, text
 from sqlalchemy.dialects.postgresql import insert
 
 from app import app, db, scheduler
@@ -18,13 +18,34 @@ from ..manifest import (
 )
 from ..models import ImageCompressionMission, ImageCompressionStatus
 from ..naming import collision_key, output_name
-from ..policy import LEGACY_PASSTHROUGH_FAILURES, is_archive_name
-from ..service import ImageCompressionService
+from ..policy import (
+    LEGACY_DECOMPRESSION_BOMB_PREFIX,
+    LEGACY_DECOMPRESSION_BOMB_SUFFIX,
+    LEGACY_FORMAT_MISMATCH_PREFIX,
+    LEGACY_PASSTHROUGH_FAILURES,
+    is_archive_name,
+)
+from ..service import ImageCompressionService, ImagePipelineError
 
 
 IMAGE_COMPRESSION_ADVISORY_LOCK_ID = 0x494D47434D505245
 STABILITY_INTERVAL_SECONDS = 30
 logger = logging.getLogger(__name__)
+
+
+class DestinationConflictError(ImagePipelineError):
+    error_code = "DESTINATION_CONFLICT"
+
+
+def _error_code(error):
+    explicit = getattr(error, "error_code", None)
+    if explicit:
+        return explicit
+    if isinstance(error, UnsafeSourceError):
+        return "SOURCE_SAFETY_ERROR"
+    if isinstance(error, OSError):
+        return "FILESYSTEM_OPERATION_FAILED"
+    return "UNEXPECTED_ERROR"
 
 
 @contextmanager
@@ -96,6 +117,7 @@ def register_next_source(source_directory, output_directory=None):
             snapshot = source_snapshot(path)
             initial_status = ImageCompressionStatus.WAITING_STABLE
             initial_error = None
+            initial_error_code = None
         except UnsafeSourceError as error:
             log_exception(
                 logger,
@@ -106,6 +128,7 @@ def register_next_source(source_directory, output_directory=None):
             snapshot = SourceSnapshot(0, 0, None, "0" * 64)
             initial_status = ImageCompressionStatus.FAILED
             initial_error = str(error)[-2000:]
+            initial_error_code = _error_code(error)
         normalized_destination = collision_key(destination_key)
         destination_exists = bool(
             output_directory
@@ -128,6 +151,15 @@ def register_next_source(source_directory, output_directory=None):
                 ImageCompressionStatus.FAILED
                 if conflicting is not None or destination_exists
                 else initial_status
+            ),
+            "error_code": (
+                "DESTINATION_CONFLICT"
+                if conflicting is not None
+                else (
+                    "OUTPUT_ALREADY_EXISTS"
+                    if destination_exists
+                    else initial_error_code
+                )
             ),
             "error_message": (
                 "Another mission maps to the same output name"
@@ -191,6 +223,7 @@ def refresh_waiting_mission(now=None):
     path = Path(mission.source_path)
     if not path.exists():
         mission.status = ImageCompressionStatus.FAILED
+        mission.error_code = "SOURCE_DISAPPEARED"
         mission.error_message = "Source disappeared while waiting for stability"
         db.session.commit()
         logger.warning(
@@ -210,6 +243,7 @@ def refresh_waiting_mission(now=None):
             mission.source_name,
         )
         mission.status = ImageCompressionStatus.FAILED
+        mission.error_code = _error_code(error)
         mission.error_message = str(error)[-2000:]
         db.session.commit()
         return mission
@@ -228,6 +262,7 @@ def refresh_waiting_mission(now=None):
         for key, value in _snapshot_values(snapshot).items():
             setattr(mission, key, value)
         mission.stable_checks = 0
+        mission.error_code = None
         mission.error_message = None
         logger.info(
             "图片来源仍在变化，重新等待稳定 | mission_id=%s | source=%s | "
@@ -261,6 +296,7 @@ def claim_ready_mission():
                 ImageCompressionMission.status: ImageCompressionStatus.MOVING,
                 ImageCompressionMission.attempts: ImageCompressionMission.attempts + 1,
                 ImageCompressionMission.processing_started_at: datetime.utcnow(),
+                ImageCompressionMission.error_code: None,
                 ImageCompressionMission.error_message: None,
             },
             synchronize_session=False,
@@ -314,11 +350,25 @@ def _retry_destination_is_reserved(mission):
     )
 
 
-def claim_retryable_format_failure(service):
+def claim_retryable_failure(service):
     candidates = (
         ImageCompressionMission.query.filter(
             ImageCompressionMission.status == ImageCompressionStatus.FAILED,
-            ImageCompressionMission.error_message.in_(LEGACY_PASSTHROUGH_FAILURES),
+            ImageCompressionMission.error_code.is_(None),
+            or_(
+                ImageCompressionMission.error_message.in_(LEGACY_PASSTHROUGH_FAILURES),
+                ImageCompressionMission.error_message.startswith(
+                    LEGACY_FORMAT_MISMATCH_PREFIX
+                ),
+                and_(
+                    ImageCompressionMission.error_message.startswith(
+                        LEGACY_DECOMPRESSION_BOMB_PREFIX
+                    ),
+                    ImageCompressionMission.error_message.contains(
+                        LEGACY_DECOMPRESSION_BOMB_SUFFIX
+                    ),
+                ),
+            ),
         )
         .order_by(ImageCompressionMission.id)
         .all()
@@ -340,11 +390,13 @@ def claim_retryable_format_failure(service):
             continue
 
         original_error = candidate.error_message
+        original_error_code = candidate.error_code
         claimed = (
             db.session.query(ImageCompressionMission)
             .filter(
                 ImageCompressionMission.id == candidate.id,
                 ImageCompressionMission.status == ImageCompressionStatus.FAILED,
+                ImageCompressionMission.error_code == original_error_code,
                 ImageCompressionMission.error_message == original_error,
             )
             .update(
@@ -356,6 +408,7 @@ def claim_retryable_format_failure(service):
                     ImageCompressionMission.output_manifest_sha256: None,
                     ImageCompressionMission.output_file_count: None,
                     ImageCompressionMission.output_size_bytes: None,
+                    ImageCompressionMission.error_code: None,
                     ImageCompressionMission.error_message: None,
                 },
                 synchronize_session=False,
@@ -383,6 +436,33 @@ def _expected_manifest(mission):
     )
 
 
+def _apply_prepared_destination(mission, prepared):
+    destination_key = prepared.destination.name
+    normalized_destination = collision_key(destination_key)
+    if normalized_destination != mission.destination_key_normalized:
+        conflicting = ImageCompressionMission.query.filter(
+            ImageCompressionMission.id != mission.id,
+            ImageCompressionMission.destination_key_normalized
+            == normalized_destination,
+            ImageCompressionMission.status != ImageCompressionStatus.FAILED,
+        ).first()
+        if conflicting is not None:
+            raise DestinationConflictError(
+                f"Normalized output name is reserved by mission {conflicting.id}: "
+                f"{destination_key}"
+            )
+        logger.warning(
+            "图片任务最终输出名称已按实际格式更新 | "
+            "event=IMAGE_DESTINATION_NORMALIZED | mission_id=%s | "
+            "original_output=%s | normalized_output=%s",
+            mission.id,
+            mission.destination_key,
+            destination_key,
+        )
+        mission.destination_key = destination_key
+        mission.destination_key_normalized = normalized_destination
+
+
 def _complete_cleanup(service, mission):
     logger.info(
         "开始完成图片任务清理 | mission_id=%s | source=%s",
@@ -393,6 +473,7 @@ def _complete_cleanup(service, mission):
     service.validate_path(mission.output_path, expected)
     service.cleanup_completed(mission.id)
     mission.status = ImageCompressionStatus.COMPLETED
+    mission.error_code = None
     mission.error_message = None
     db.session.commit()
     logger.info(
@@ -420,6 +501,7 @@ def _recover_publishing(service, mission):
     )
     service.publish(plan)
     mission.status = ImageCompressionStatus.CLEANUP_PENDING
+    mission.error_code = None
     mission.error_message = None
     db.session.commit()
     logger.info(
@@ -449,6 +531,7 @@ def process_mission(service, mission):
             )
             service.ensure_ingested(mission.source_path, mission.id)
             mission.status = ImageCompressionStatus.PROCESSING
+            mission.error_code = None
             mission.error_message = None
             db.session.commit()
             logger.info(
@@ -465,6 +548,7 @@ def process_mission(service, mission):
                 mission.source_name,
                 mission.destination_key,
             )
+            _apply_prepared_destination(mission, prepared)
             publish_plan = service.stage_for_publish(mission.id, prepared)
             mission.output_path = str(publish_plan.destination)
             mission.output_manifest_sha256 = publish_plan.manifest.digest
@@ -511,12 +595,19 @@ def process_mission(service, mission):
             return Path(mission.output_path)
         return None
     except Exception as error:
+        error_code = _error_code(error)
         log_exception(
             logger,
-            "图片流水线失败 | mission_id=%s | source=%s",
+            "图片流水线失败 | error_code=%s | mission_id=%s | status=%s | "
+            "attempt=%s | source=%s | source_path=%s | pending_source=%s",
             error,
+            error_code,
             mission_id,
+            getattr(mission, "status", "unknown"),
+            getattr(mission, "attempts", "unknown"),
             source_name,
+            getattr(mission, "source_path", "unknown"),
+            service.mission_directory(mission_id) / "source",
         )
         try:
             db.session.rollback()
@@ -547,6 +638,7 @@ def process_mission(service, mission):
                     cleanup_error,
                     mission_id,
                 )
+        mission.error_code = error_code
         mission.error_message = str(error)[-2000:]
         try:
             db.session.commit()
@@ -588,7 +680,7 @@ def process_one_mission():
     if active is not None:
         return process_mission(service, active)
 
-    retryable = claim_retryable_format_failure(service)
+    retryable = claim_retryable_failure(service)
     if retryable is not None:
         return process_mission(service, retryable)
 

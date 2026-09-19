@@ -1,4 +1,5 @@
 MAX_IMAGE_BYTES = 3 * 1024 * 1024
+MAX_DECODE_PIXELS = 89_478_485
 MAX_ARCHIVE_DEPTH = 16
 MAX_ARCHIVE_MEMBERS = 100_000
 MAX_EXPANDED_BYTES = 500 * 1024**3
@@ -41,6 +42,7 @@ KNOWN_IMAGE_EXTENSIONS = {
     ".jpe",
     ".jpeg",
     ".jpg",
+    ".mpo",
     ".png",
     ".tif",
     ".tiff",
@@ -53,12 +55,25 @@ FORMAT_EXTENSIONS = {
     "GIF": {".gif"},
     "HEIF": {".heic", ".heif"},
     "JPEG": {".jpe", ".jpeg", ".jpg"},
+    "MPO": {".mpo"},
     "PNG": {".apng", ".png"},
     "TIFF": {".tif", ".tiff"},
     "WEBP": {".webp"},
 }
 
-PASSTHROUGH_FORMATS = {"GIF", "WEBP"}
+CANONICAL_FORMAT_EXTENSIONS = {
+    "AVIF": ".avif",
+    "BMP": ".bmp",
+    "GIF": ".gif",
+    "HEIF": ".heif",
+    "JPEG": ".jpg",
+    "MPO": ".mpo",
+    "PNG": ".png",
+    "TIFF": ".tiff",
+    "WEBP": ".webp",
+}
+
+PASSTHROUGH_FORMATS = {"GIF", "MPO", "WEBP"}
 REENCODABLE_FORMATS = {"JPEG", "PNG"}
 
 # These messages identify missions created by the pre-passthrough policy. They
@@ -67,6 +82,9 @@ LEGACY_PASSTHROUGH_FAILURES = frozenset(
     f"Images of format {image_format} above 3 MiB are not supported"
     for image_format in PASSTHROUGH_FORMATS
 )
+LEGACY_FORMAT_MISMATCH_PREFIX = "Image format does not match its extension:"
+LEGACY_DECOMPRESSION_BOMB_PREFIX = "Image size ("
+LEGACY_DECOMPRESSION_BOMB_SUFFIX = "could be decompression bomb DOS attack."
 
 
 def archive_suffix(name):

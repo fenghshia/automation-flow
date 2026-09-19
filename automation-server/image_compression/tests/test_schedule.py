@@ -114,14 +114,16 @@ class SchedulerTests(unittest.TestCase):
             source_kind="file",
             source_name="source.txt",
             destination_key="output.txt",
+            destination_key_normalized="output.txt",
             status=ImageCompressionStatus.MOVING,
             output_path=None,
             output_manifest_sha256=None,
             output_file_count=None,
             output_size_bytes=None,
+            error_code=None,
             error_message=None,
         )
-        prepared = SimpleNamespace()
+        prepared = SimpleNamespace(destination=destination)
         plan = SimpleNamespace(destination=destination, manifest=manifest)
         service = MagicMock()
         service.prepare_batch.return_value = prepared
@@ -148,6 +150,7 @@ class SchedulerTests(unittest.TestCase):
             output_manifest_sha256="b" * 64,
             output_file_count=1,
             output_size_bytes=4,
+            error_code=None,
             error_message=None,
         )
         service = MagicMock()
@@ -162,12 +165,14 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(ImageCompressionStatus.CLEANUP_PENDING, mission.status)
+        self.assertEqual("FILESYSTEM_OPERATION_FAILED", mission.error_code)
         self.assertEqual("busy", mission.error_message)
 
     def test_legacy_format_errors_are_exactly_scoped(self):
         self.assertEqual(
             {
                 "Images of format GIF above 3 MiB are not supported",
+                "Images of format MPO above 3 MiB are not supported",
                 "Images of format WEBP above 3 MiB are not supported",
             },
             LEGACY_PASSTHROUGH_FAILURES,
@@ -229,9 +234,44 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(reserved)
         query.filter.return_value.first.assert_called_once_with()
 
-    def test_claim_retryable_format_failure_uses_conditional_update(self):
+    def test_prepared_destination_updates_mislabeled_loose_file_key(self):
+        mission = SimpleNamespace(
+            id=6,
+            destination_key="photo.png",
+            destination_key_normalized="photo.png",
+        )
+        prepared = SimpleNamespace(destination=Path("photo.jpg"))
+        query = MagicMock()
+        query.filter.return_value.first.return_value = None
+
+        with schedule_module.app.app_context(), patch.object(
+            schedule_module.ImageCompressionMission, "query", query
+        ):
+            schedule_module._apply_prepared_destination(mission, prepared)
+
+        self.assertEqual("photo.jpg", mission.destination_key)
+        self.assertEqual("photo.jpg", mission.destination_key_normalized)
+
+    def test_prepared_destination_rejects_another_active_mission(self):
+        mission = SimpleNamespace(
+            id=6,
+            destination_key="photo.png",
+            destination_key_normalized="photo.png",
+        )
+        prepared = SimpleNamespace(destination=Path("photo.jpg"))
+        query = MagicMock()
+        query.filter.return_value.first.return_value = SimpleNamespace(id=7)
+
+        with schedule_module.app.app_context(), patch.object(
+            schedule_module.ImageCompressionMission, "query", query
+        ):
+            with self.assertRaises(schedule_module.DestinationConflictError):
+                schedule_module._apply_prepared_destination(mission, prepared)
+
+    def test_claim_retryable_failure_uses_conditional_update(self):
         candidate = SimpleNamespace(
             id=4,
+            error_code=None,
             error_message="Images of format GIF above 3 MiB are not supported",
             destination_key_normalized="source.gif",
         )
@@ -254,7 +294,7 @@ class SchedulerTests(unittest.TestCase):
             ), patch.object(
                 schedule_module, "_retry_destination_is_reserved", return_value=False
             ):
-                result = schedule_module.claim_retryable_format_failure(MagicMock())
+                result = schedule_module.claim_retryable_failure(MagicMock())
 
         self.assertIs(claimed_mission, result)
         update_query.filter.return_value.update.assert_called_once()
@@ -264,17 +304,24 @@ class SchedulerTests(unittest.TestCase):
             updates[schedule_module.ImageCompressionMission.status],
         )
         self.assertIsNone(updates[schedule_module.ImageCompressionMission.error_message])
+        self.assertIsNone(updates[schedule_module.ImageCompressionMission.error_code])
         self.assertIsNone(updates[schedule_module.ImageCompressionMission.output_path])
         session.commit.assert_called_once_with()
         session.get.assert_called_once_with(schedule_module.ImageCompressionMission, 4)
 
-    def test_claim_retryable_format_failure_skips_unsafe_candidate(self):
+    def test_claim_retryable_failure_skips_unsafe_candidate(self):
         candidates = [
             SimpleNamespace(
-                id=4, error_message="first", destination_key_normalized="first.gif"
+                id=4,
+                error_code=None,
+                error_message="first",
+                destination_key_normalized="first.gif",
             ),
             SimpleNamespace(
-                id=5, error_message="second", destination_key_normalized="second.gif"
+                id=5,
+                error_code=None,
+                error_message="second",
+                destination_key_normalized="second.gif",
             ),
         ]
         claimed_mission = SimpleNamespace(id=5, status=ImageCompressionStatus.PROCESSING)
@@ -298,7 +345,7 @@ class SchedulerTests(unittest.TestCase):
             ), patch.object(
                 schedule_module, "_retry_destination_is_reserved", return_value=False
             ):
-                result = schedule_module.claim_retryable_format_failure(MagicMock())
+                result = schedule_module.claim_retryable_failure(MagicMock())
 
         self.assertIs(claimed_mission, result)
         session.get.assert_called_once_with(schedule_module.ImageCompressionMission, 5)

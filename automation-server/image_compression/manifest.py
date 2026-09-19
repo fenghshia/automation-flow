@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 class UnsafeSourceError(RuntimeError):
-    pass
+    error_code = "SOURCE_SAFETY_ERROR"
 
 
 @dataclass(frozen=True)
