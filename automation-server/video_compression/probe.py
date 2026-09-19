@@ -49,13 +49,20 @@ def _rotation(stream):
     return (value or 0) % 360
 
 
+def _calculated_bit_rate(format_data, duration):
+    size_bytes = _number(format_data.get("size"), int)
+    if size_bytes is None or size_bytes <= 0 or duration is None or duration <= 0:
+        return None
+    return int(size_bytes * 8 / duration)
+
+
 def probe_video(path, ffprobe_path, timeout=60):
     command = [
         str(ffprobe_path),
         "-v", "error",
         "-select_streams", "v:0",
         "-show_entries",
-        "stream=codec_name,width,height,avg_frame_rate,bit_rate:stream_tags=rotate:stream_side_data=rotation:format=duration,bit_rate",
+        "stream=codec_name,width,height,avg_frame_rate,bit_rate:stream_tags=rotate:stream_side_data=rotation:format=duration,bit_rate,size",
         "-of", "json",
         str(path),
     ]
@@ -85,14 +92,20 @@ def probe_video(path, ffprobe_path, timeout=60):
     fps_fraction = _number(stream.get("avg_frame_rate"), Fraction, Fraction(0, 1))
     stream_rate = _number(stream.get("bit_rate"), int)
     format_data = payload.get("format", {})
+    duration = _number(format_data.get("duration"), float)
+    bit_rate = (
+        stream_rate
+        or _number(format_data.get("bit_rate"), int)
+        or _calculated_bit_rate(format_data, duration)
+    )
     try:
         return VideoInfo(
             codec_name=(stream.get("codec_name") or "").lower(),
             width=int(stream["width"]),
             height=int(stream["height"]),
             fps=float(fps_fraction),
-            bit_rate=stream_rate or _number(format_data.get("bit_rate"), int),
-            duration=_number(format_data.get("duration"), float),
+            bit_rate=bit_rate,
+            duration=duration,
             rotation=_rotation(stream),
         )
     except (KeyError, TypeError, ValueError) as error:

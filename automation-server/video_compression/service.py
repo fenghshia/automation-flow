@@ -45,12 +45,15 @@ class CompressionService:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def validate_output(self, path):
+    def _validate_video(self, path, *, require_transcoded_specification):
         logger.info("开始验证视频 | file=%s", Path(path).name)
         info = probe_video(path, self.ffprobe_path)
-        errors = validate_specification(info)
-        if errors:
-            raise CompressionError("Output validation failed: " + "; ".join(errors))
+        if require_transcoded_specification:
+            errors = validate_specification(info)
+            if errors:
+                raise CompressionError(
+                    "Output validation failed: " + "; ".join(errors)
+                )
         duration = info.duration or 0
         verify_decodable(path, self.ffmpeg_path, timeout=max(120, int(duration * 2 + 60)))
         logger.info(
@@ -63,6 +66,18 @@ class CompressionService:
             info.bit_rate if info.bit_rate is not None else "unknown",
         )
         return info
+
+    def validate_output(self, path):
+        return self._validate_video(
+            path,
+            require_transcoded_specification=False,
+        )
+
+    def validate_transcoded_output(self, path):
+        return self._validate_video(
+            path,
+            require_transcoded_specification=True,
+        )
 
     @staticmethod
     def _direct_child(path, directory, description):
@@ -161,12 +176,14 @@ class CompressionService:
             source_info.fps,
             source_info.bit_rate if source_info.bit_rate is not None else "unknown",
             "transcode" if plan.transcode else "copy",
-            "; ".join(plan.reasons) if plan.reasons else "already compliant",
+            "; ".join(plan.reasons)
+            if plan.reasons
+            else "bitrate does not require transcoding",
         )
         if not plan.transcode:
             self.validate_output(source)
             logger.info(
-                "源视频符合规格，开始复制到暂存区 | mission_id=%s | source=%s",
+                "源视频码率不超过阈值，开始原样复制到暂存区 | mission_id=%s | source=%s",
                 mission_id,
                 source.name,
             )
@@ -202,7 +219,7 @@ class CompressionService:
                 timeout=timeout,
                 duration=duration,
             )
-            self.validate_output(work)
+            self.validate_transcoded_output(work)
             logger.info(
                 "转码成品验证通过，开始复制到暂存区 | mission_id=%s | source=%s",
                 mission_id,
@@ -293,7 +310,7 @@ class CompressionService:
                 timeout=max(900, int(duration * 10 + 300)),
                 duration=duration,
             )
-            self.validate_output(temporary)
+            self.validate_transcoded_output(temporary)
             self._publish_and_remove_source(
                 temporary, source, destination, published_callback
             )

@@ -29,19 +29,14 @@ def target_dimensions(width, height):
 
 
 def make_plan(info: VideoInfo):
+    if info.bit_rate is None:
+        raise ValueError("video bitrate is unavailable; compression cannot be decided")
+
     display_width, display_height = info.display_width, info.display_height
     width, height = target_dimensions(display_width, display_height)
     reasons = []
-    if info.bit_rate is None or info.bit_rate > MAX_VIDEO_BIT_RATE:
-        reasons.append("video bitrate is unknown or above 5 Mbps")
-    if (width, height) != (display_width, display_height):
-        reasons.append("display dimensions exceed the permitted bounds")
-    if info.codec_name not in {"hevc", "h265"}:
-        reasons.append("video codec is not HEVC")
-    if info.fps <= 0:
-        reasons.append("frame rate is unavailable")
-    if info.fps > MAX_FPS + 0.01:
-        reasons.append("frame rate is above 30 fps")
+    if info.bit_rate > MAX_VIDEO_BIT_RATE:
+        reasons.append("video bitrate is above 5 Mbps")
     return CompressionPlan(
         transcode=bool(reasons),
         width=width,

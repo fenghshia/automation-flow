@@ -142,7 +142,7 @@ class RecoverablePublishingTests(unittest.TestCase):
                 ),
             ), patch(
                 "video_compression.service.make_plan",
-                return_value=SimpleNamespace(transcode=False),
+                return_value=SimpleNamespace(transcode=False, reasons=()),
             ):
                 prepared = service.prepare(source, 7, destination)
 
@@ -150,6 +150,47 @@ class RecoverablePublishingTests(unittest.TestCase):
             self.assertFalse(destination.exists())
             self.assertEqual(b"video", prepared.staging.read_bytes())
             service.validate_output.assert_called_once_with(source.resolve())
+
+
+class ValidationTests(unittest.TestCase):
+    @patch("video_compression.service.verify_decodable")
+    @patch("video_compression.service.probe_video")
+    def test_passthrough_validation_allows_low_bitrate_original_specification(
+        self, probe_video_mock, verify_decodable_mock
+    ):
+        probe_video_mock.return_value = SimpleNamespace(
+            codec_name="h264",
+            display_width=3840,
+            display_height=2160,
+            fps=60.0,
+            bit_rate=4_900_000,
+            duration=10.0,
+        )
+        service = CompressionService(Path("tools"), Path("output"))
+
+        service.validate_output(Path("source.mp4"))
+
+        verify_decodable_mock.assert_called_once()
+
+    @patch("video_compression.service.verify_decodable")
+    @patch("video_compression.service.probe_video")
+    def test_transcoded_validation_still_requires_target_specification(
+        self, probe_video_mock, verify_decodable_mock
+    ):
+        probe_video_mock.return_value = SimpleNamespace(
+            codec_name="h264",
+            display_width=3840,
+            display_height=2160,
+            fps=60.0,
+            bit_rate=4_900_000,
+            duration=10.0,
+        )
+        service = CompressionService(Path("tools"), Path("output"))
+
+        with self.assertRaisesRegex(CompressionError, "codec is not HEVC"):
+            service.validate_transcoded_output(Path("transcoded.mp4"))
+
+        verify_decodable_mock.assert_not_called()
 
 
 if __name__ == "__main__":
