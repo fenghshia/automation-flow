@@ -9,6 +9,8 @@ from env import EnvConfig
 from iwara import *
 from video_compression import *
 from image_compression import *
+import video_filter.models
+import media_lineage.models
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

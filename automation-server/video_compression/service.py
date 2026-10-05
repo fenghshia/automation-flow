@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .policy import make_plan, validate_specification
+from .policy import make_plan, validate_transcoded_specification
 from .probe import probe_video, verify_decodable
 from .transcoder import transcode
 
@@ -49,7 +49,7 @@ class CompressionService:
         logger.info("开始验证视频 | file=%s", Path(path).name)
         info = probe_video(path, self.ffprobe_path)
         if require_transcoded_specification:
-            errors = validate_specification(info)
+            errors = validate_transcoded_specification(info)
             if errors:
                 raise CompressionError(
                     "Output validation failed: " + "; ".join(errors)
@@ -67,7 +67,7 @@ class CompressionService:
         )
         return info
 
-    def validate_output(self, path):
+    def validate_deliverable(self, path):
         return self._validate_video(
             path,
             require_transcoded_specification=False,
@@ -181,7 +181,7 @@ class CompressionService:
             else "bitrate does not require transcoding",
         )
         if not plan.transcode:
-            self.validate_output(source)
+            self.validate_deliverable(source)
             logger.info(
                 "源视频码率不超过阈值，开始原样复制到暂存区 | mission_id=%s | source=%s",
                 mission_id,
@@ -253,7 +253,7 @@ class CompressionService:
             mission_id,
             destination.name,
         )
-        self.validate_output(staging)
+        self.validate_deliverable(staging)
         os.link(staging, destination)
         logger.info(
             "视频发布完成 | mission_id=%s | file=%s",
@@ -268,7 +268,7 @@ class CompressionService:
         staging = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
         try:
             shutil.copy2(artifact, staging)
-            self.validate_output(staging)
+            self.validate_deliverable(staging)
             os.link(staging, destination)
             if published_callback is not None:
                 published_callback(destination)
@@ -277,6 +277,23 @@ class CompressionService:
             staging.unlink(missing_ok=True)
 
     def process(self, source, published_callback=None):
+        from media_lineage.integration import direct_compression, direct_published, direct_cleaned, serialized_gpu
+
+        @serialized_gpu
+        def run():
+            origin = Path(source).resolve()
+            destination = (self.output_dir / origin.name).resolve()
+            with direct_compression(origin, destination) as operation:
+                def published(path):
+                    if published_callback is not None:
+                        published_callback(path)
+                    direct_published(operation)
+                result = self._process(source, published)
+                direct_cleaned(operation)
+                return result
+        return run()
+
+    def _process(self, source, published_callback=None):
         source = Path(source).resolve()
         if not source.is_file():
             raise CompressionError(f"Source file does not exist: {source.name}")
@@ -293,7 +310,7 @@ class CompressionService:
         source_info = probe_video(source, self.ffprobe_path)
         plan = make_plan(source_info)
         if not plan.transcode:
-            self.validate_output(source)
+            self.validate_deliverable(source)
             self._publish_and_remove_source(
                 source, source, destination, published_callback
             )
