@@ -27,9 +27,12 @@ class CompressionMission(db.Model):
     )
     attempts = db.Column(db.Integer, nullable=False, default=0)
     output_path = db.Column(db.Text, nullable=True)
+    workflow_id = db.Column(db.String(36), nullable=True, index=True)
+    reset_epoch = db.Column(db.String(36), nullable=True)
+    directory_revision_id = db.Column(db.String(36), nullable=True)
+    pinned_output_directory = db.Column(db.Text, nullable=True)
     error_message = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(
         db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
     )
-

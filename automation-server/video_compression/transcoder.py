@@ -1,4 +1,5 @@
 import logging
+import os
 import queue
 import subprocess
 import tempfile
@@ -94,6 +95,9 @@ def transcode(ffmpeg_path, source, destination, plan, timeout, duration=None):
     started_at = time.monotonic()
     messages = queue.Queue()
     process = None
+    tree = None
+    from media_lineage.resources import current_lease
+    managed = bool(current_lease())
     with tempfile.TemporaryFile(
         mode="w+t", encoding="utf-8", errors="replace"
     ) as stderr_stream:
@@ -105,7 +109,11 @@ def transcode(ffmpeg_path, source, destination, plan, timeout, duration=None):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                start_new_session=managed and os.name != "nt",
             )
+            if managed:
+                from media_lineage.process_tree import ProcessTree
+                tree = ProcessTree(process)
             reader = threading.Thread(
                 target=_read_progress,
                 args=(process.stdout, messages),
@@ -142,12 +150,14 @@ def transcode(ffmpeg_path, source, destination, plan, timeout, duration=None):
             return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
         except (OSError, subprocess.TimeoutExpired) as error:
             if process is not None and process.poll() is None:
-                process.kill()
+                tree.terminate() if tree else process.kill()
                 process.wait()
             raise TranscodeError(
                 f"FFmpeg failed while processing {Path(source).name}: {error}"
             ) from error
         finally:
+            if tree:
+                tree.close()
             if process is not None and process.stdout is not None:
                 process.stdout.close()
 

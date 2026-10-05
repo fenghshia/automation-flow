@@ -15,7 +15,7 @@ class PublishingSafetyTests(unittest.TestCase):
             destination = root / "output.mp4"
             source.write_bytes(b"video")
             service = CompressionService(root, root)
-            service.validate_output = Mock(side_effect=RuntimeError("invalid"))
+            service.validate_deliverable = Mock(side_effect=RuntimeError("invalid"))
 
             with self.assertRaisesRegex(RuntimeError, "invalid"):
                 service._publish_and_remove_source(source, source, destination)
@@ -31,7 +31,7 @@ class PublishingSafetyTests(unittest.TestCase):
             destination.parent.mkdir()
             source.write_bytes(b"video")
             service = CompressionService(root, destination.parent)
-            service.validate_output = Mock(return_value=None)
+            service.validate_deliverable = Mock(return_value=None)
             callback = Mock()
 
             service._publish_and_remove_source(
@@ -50,7 +50,7 @@ class PublishingSafetyTests(unittest.TestCase):
             source.write_bytes(b"new")
             destination.write_bytes(b"old")
             service = CompressionService(root, root)
-            service.validate_output = Mock(return_value=None)
+            service.validate_deliverable = Mock(return_value=None)
 
             with self.assertRaises(FileExistsError):
                 service._publish_and_remove_source(source, source, destination)
@@ -66,7 +66,7 @@ class RecoverablePublishingTests(unittest.TestCase):
         output.mkdir()
         cache.mkdir()
         service = CompressionService(root, output, cache)
-        service.validate_output = Mock(return_value=None)
+        service.validate_deliverable = Mock(return_value=None)
         return service
 
     def test_task_paths_are_deterministic_and_confined(self):
@@ -119,7 +119,7 @@ class RecoverablePublishingTests(unittest.TestCase):
             self.assertEqual(b"new", staging.read_bytes())
             self.assertEqual(b"old", destination.read_bytes())
 
-    def test_prepare_creates_recoverable_staging_before_publication(self):
+    def test_low_bitrate_nonstandard_video_is_copied_without_transcoding(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             service = self.make_service(root)
@@ -134,22 +134,23 @@ class RecoverablePublishingTests(unittest.TestCase):
             with patch(
                 "video_compression.service.probe_video",
                 return_value=SimpleNamespace(
-                    codec_name="hevc",
-                    display_width=1920,
-                    display_height=1080,
-                    fps=30.0,
+                    codec_name="h264",
+                    display_width=3840,
+                    display_height=2160,
+                    fps=60.0,
                     bit_rate=4_500_000,
                 ),
             ), patch(
-                "video_compression.service.make_plan",
-                return_value=SimpleNamespace(transcode=False, reasons=()),
-            ):
+                "video_compression.service.transcode"
+            ) as transcode_mock:
                 prepared = service.prepare(source, 7, destination)
 
             self.assertTrue(source.exists())
             self.assertFalse(destination.exists())
             self.assertEqual(b"video", prepared.staging.read_bytes())
-            service.validate_output.assert_called_once_with(source.resolve())
+            self.assertFalse(prepared.transcoded)
+            transcode_mock.assert_not_called()
+            service.validate_deliverable.assert_called_once_with(source.resolve())
 
 
 class ValidationTests(unittest.TestCase):
@@ -168,7 +169,7 @@ class ValidationTests(unittest.TestCase):
         )
         service = CompressionService(Path("tools"), Path("output"))
 
-        service.validate_output(Path("source.mp4"))
+        service.validate_deliverable(Path("source.mp4"))
 
         verify_decodable_mock.assert_called_once()
 

@@ -1,6 +1,10 @@
 import unittest
 
-from video_compression.policy import make_plan, target_dimensions, validate_specification
+from video_compression.policy import (
+    make_plan,
+    target_dimensions,
+    validate_transcoded_specification,
+)
 from video_compression.probe import VideoInfo
 
 
@@ -20,7 +24,7 @@ class PolicyTests(unittest.TestCase):
     def test_source_at_5_mbps_is_moved_without_transcoding(self):
         info = VideoInfo("hevc", 1920, 1080, 30.0, 5_000_000, 10.0)
         self.assertFalse(make_plan(info).transcode)
-        self.assertEqual([], validate_specification(info))
+        self.assertEqual([], validate_transcoded_specification(info))
 
     def test_low_bitrate_source_ignores_codec_dimensions_and_frame_rate(self):
         info = VideoInfo("h264", 3840, 2160, 60.0, 4_900_000, 10.0)
@@ -40,13 +44,13 @@ class PolicyTests(unittest.TestCase):
 
     def test_output_validation_allows_bitrate_up_to_5_5_mbps(self):
         info = VideoInfo("hevc", 1920, 1080, 30.0, 5_500_000, 10.0)
-        self.assertEqual([], validate_specification(info))
+        self.assertEqual([], validate_transcoded_specification(info))
 
     def test_output_validation_rejects_bitrate_above_5_5_mbps(self):
         info = VideoInfo("hevc", 1920, 1080, 30.0, 5_500_001, 10.0)
         self.assertEqual(
             ["average video bitrate is 5500001, above 5500000"],
-            validate_specification(info),
+            validate_transcoded_specification(info),
         )
 
     def test_rotation_uses_display_dimensions(self):

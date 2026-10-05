@@ -9,8 +9,10 @@ from sqlalchemy.dialects.postgresql import insert
 from app import app, db, scheduler
 from env import EnvConfig
 from logging_config import log_exception
+from media_lineage.integration import compression_begin, compression_published, compression_cleaned, serialized_gpu
 from ..models import CompressionMission, CompressionStatus
 from ..service import CompressionError, CompressionService
+from media_lineage.workflows import current_binding, workflow_scope
 
 
 SUPPORTED_SUFFIXES = {".mp4"}
@@ -39,16 +41,26 @@ def video_compression_lock(engine):
 
 def discover_source_files(source_directory):
     source_directory = Path(source_directory)
+    if current_binding():
+        from media_lineage.files import reject_media_links
+        reject_media_links(source_directory)
     if not source_directory.is_dir():
         raise RuntimeError("VIDEO_COMPRESSION_SOURCE_DIR does not exist or is not a directory.")
-    return sorted(
-        path.resolve()
-        for path in source_directory.iterdir()
-        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
-    )
+    files = []
+    for path in source_directory.iterdir():
+        if current_binding():
+            reject_media_links(path)
+        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
+            files.append(path.resolve())
+    files.sort()
+    if current_binding():
+        for path in files:
+            reject_media_links(path)
+    return files
 
 
 def insert_mission_if_missing(session, path, stat):
+    binding = current_binding()
     statement = (
         insert(CompressionMission)
         .values(
@@ -58,6 +70,10 @@ def insert_mission_if_missing(session, path, stat):
             modified_ns=stat.st_mtime_ns,
             stable_checks=0,
             status=CompressionStatus.WAITING_STABLE,
+            workflow_id=binding["id"] if binding else None,
+            reset_epoch=binding["reset_epoch"] if binding else None,
+            directory_revision_id=binding["directory_revision_id"] if binding else None,
+            pinned_output_directory=binding["destination_directory"] if binding else None,
         )
         .on_conflict_do_nothing(index_elements=[CompressionMission.source_path])
         .returning(CompressionMission.id)
@@ -76,8 +92,16 @@ def refresh_missions(source_directory):
                 stat.st_size,
             )
             continue
-        mission = CompressionMission.query.filter_by(source_path=source_path).first()
+        mission = mission_query().filter_by(source_path=source_path).first()
         if mission is None:
+            binding = current_binding()
+            old = CompressionMission.query.filter_by(source_path=source_path).first()
+            if binding and old and old.status == CompressionStatus.COMPLETED:
+                old.workflow_id, old.reset_epoch = binding["id"], binding["reset_epoch"]
+                old.directory_revision_id, old.pinned_output_directory = binding["directory_revision_id"], binding["destination_directory"]
+                old.size_bytes, old.modified_ns, old.file_name = stat.st_size, stat.st_mtime_ns, path.name
+                old.stable_checks, old.output_path, old.error_message = 0, None, None
+                old.status = CompressionStatus.WAITING_STABLE
             continue
         if mission.status == CompressionStatus.COMPLETED:
             mission.file_name = path.name
@@ -128,7 +152,7 @@ def refresh_missions(source_directory):
 
 def claim_next_mission(service):
     candidate = (
-        CompressionMission.query.filter_by(status=CompressionStatus.READY)
+        mission_query().filter_by(status=CompressionStatus.READY)
         .order_by(CompressionMission.id)
         .first()
     )
@@ -170,6 +194,10 @@ def claim_next_mission(service):
 
 
 def mission_paths(mission, service, source_directory):
+    binding = current_binding()
+    if binding and (mission.workflow_id, mission.reset_epoch, mission.directory_revision_id, mission.pinned_output_directory) != (
+            binding["id"], binding["reset_epoch"], binding["directory_revision_id"], binding["destination_directory"]):
+        raise CompressionError("compression_workflow_changed")
     source_directory = Path(source_directory).resolve()
     source = Path(mission.source_path).resolve()
     if source.parent != source_directory or source.name != mission.file_name:
@@ -241,7 +269,7 @@ def files_are_same(first, second):
 
 def finish_cleanup_pending(service, source_directory):
     mission = (
-        CompressionMission.query.filter_by(status=CompressionStatus.CLEANUP_PENDING)
+        mission_query().filter_by(status=CompressionStatus.CLEANUP_PENDING)
         .order_by(CompressionMission.id)
         .first()
     )
@@ -264,10 +292,12 @@ def finish_cleanup_pending(service, source_directory):
             raise CompressionError(
                 "Mission staging file does not match the published output"
             )
-        service.validate_output(output)
+        service.validate_deliverable(output)
+        compression_published(db.session, mission, allow_missing=True)
         service.discard_staging_file(mission.id, output)
         service.discard_work_file(mission.id)
         source.unlink(missing_ok=True)
+        compression_cleaned(db.session, mission)
     except (OSError, RuntimeError, ValueError) as error:
         fail_mission(mission, error)
         return True
@@ -286,7 +316,7 @@ def finish_cleanup_pending(service, source_directory):
 
 def recover_validating_mission(service, source_directory):
     mission = (
-        CompressionMission.query.filter_by(status=CompressionStatus.VALIDATING)
+        mission_query().filter_by(status=CompressionStatus.VALIDATING)
         .order_by(CompressionMission.id)
         .first()
     )
@@ -316,7 +346,9 @@ def recover_validating_mission(service, source_directory):
                 raise CompressionError(
                     "Mission staging file does not match the published output"
                 )
-            service.validate_output(output)
+            service.validate_deliverable(output)
+            compression_published(db.session, mission, allow_missing=True)
+            compression_cleaned(db.session, mission)
             service.discard_staging_file(mission.id, output)
             service.discard_work_file(mission.id)
             mission.status = CompressionStatus.COMPLETED
@@ -352,11 +384,12 @@ def recover_validating_mission(service, source_directory):
                 raise CompressionError(
                     "Published output conflicts with the mission staging file"
                 )
-            service.validate_output(output)
+            service.validate_deliverable(output)
         else:
             service.publish_prepared(mission.id, output)
 
         mission.status = CompressionStatus.CLEANUP_PENDING
+        compression_published(db.session, mission)
         mission.output_path = str(output)
         mission.error_message = None
         db.session.commit()
@@ -374,7 +407,7 @@ def recover_validating_mission(service, source_directory):
 
 def recover_processing_mission(service, source_directory):
     mission = (
-        CompressionMission.query.filter_by(status=CompressionStatus.PROCESSING)
+        mission_query().filter_by(status=CompressionStatus.PROCESSING)
         .order_by(CompressionMission.id)
         .first()
     )
@@ -404,7 +437,9 @@ def recover_processing_mission(service, source_directory):
                 raise CompressionError(
                     "Mission staging file does not match the published output"
                 )
-            service.validate_output(output)
+            service.validate_deliverable(output)
+            compression_published(db.session, mission, allow_missing=True)
+            compression_cleaned(db.session, mission)
             service.discard_staging_file(mission.id, output)
             service.discard_work_file(mission.id)
             mission.status = CompressionStatus.COMPLETED
@@ -423,7 +458,8 @@ def recover_processing_mission(service, source_directory):
                 raise CompressionError(
                     "Published output exists but its ownership cannot be verified"
                 )
-            service.validate_output(output)
+            service.validate_deliverable(output)
+            compression_published(db.session, mission)
             mission.status = CompressionStatus.CLEANUP_PENDING
             mission.output_path = str(output)
             mission.error_message = None
@@ -439,7 +475,7 @@ def recover_processing_mission(service, source_directory):
 
         if staging_exists:
             try:
-                service.validate_output(staging)
+                service.validate_deliverable(staging)
             except RuntimeError as validation_error:
                 log_exception(
                     logger,
@@ -489,9 +525,11 @@ def recover_processing_mission(service, source_directory):
     return True
 
 
+@serialized_gpu
 def process_one_mission():
-    source_dir = EnvConfig.video_compression_source_directory()
-    output_dir = EnvConfig.video_compression_output_directory()
+    binding = current_binding()
+    source_dir = Path(binding["source_directory"]) if binding else EnvConfig.video_compression_source_directory()
+    output_dir = Path(binding["destination_directory"]) if binding else EnvConfig.video_compression_output_directory()
     if source_dir == output_dir:
         raise RuntimeError("Video source and output directories must be different.")
     service = CompressionService(
@@ -519,6 +557,7 @@ def process_one_mission():
     output = None
     try:
         source, output, _, _ = mission_paths(mission, service, source_dir)
+        compression_begin(db.session, mission, source, output)
         prepared = service.prepare(source, mission.id, output)
     except Exception as error:
         log_exception(
@@ -576,6 +615,7 @@ def process_one_mission():
 
     try:
         service.publish_prepared(mission.id, prepared.destination)
+        compression_published(db.session, mission)
     except (OSError, RuntimeError, ValueError) as error:
         fail_mission(mission, error)
         return None
@@ -591,10 +631,12 @@ def process_one_mission():
     )
 
     try:
+        compression_published(db.session, mission)
         service.discard_staging_file(mission.id, prepared.destination)
         service.discard_work_file(mission.id)
         source.unlink(missing_ok=True)
-    except OSError as error:
+        compression_cleaned(db.session, mission)
+    except (OSError, RuntimeError, ValueError) as error:
         fail_mission(mission, error)
         return None
 
@@ -624,7 +666,20 @@ def compress_videos():
         with app.app_context():
             with video_compression_lock(db.engine) as acquired:
                 if acquired:
-                    process_one_mission()
+                    settings = EnvConfig.video_filter_settings() if EnvConfig.video_filter_enabled() else {}
+                    if settings.get("grouped"):
+                        from media_lineage.models import WorkflowBinding
+                        bindings = db.session.execute(db.select(WorkflowBinding).where(WorkflowBinding.enabled == True)).scalars().all()
+                        configured = {g["name"]: g for g in settings["groups"] if g["enabled"] and g["compression_enabled"]}
+                        for row in bindings:
+                            group = configured.get(row.name)
+                            if not group or (str(group["directories"]["liked_source"]), str(group["directories"]["liked"])) != (row.source_directory, row.destination_directory):
+                                continue
+                            values = {key: getattr(row, key) for key in ("id", "reset_epoch", "directory_revision_id", "source_directory", "destination_directory")}
+                            with workflow_scope(values):
+                                process_one_mission()
+                    else:
+                        process_one_mission()
                 else:
                     logger.info("视频定时任务跳过：另一进程正在处理")
     except Exception as error:
@@ -634,3 +689,11 @@ def compress_videos():
         except Exception as rollback_error:
             log_exception(logger, "视频定时任务回滚失败", rollback_error)
         return None
+
+
+def mission_query():
+    binding = current_binding()
+    query = CompressionMission.query
+    if binding:
+        return query.filter_by(workflow_id=binding["id"], reset_epoch=binding["reset_epoch"], directory_revision_id=binding["directory_revision_id"])
+    return query.filter(CompressionMission.workflow_id.is_(None))

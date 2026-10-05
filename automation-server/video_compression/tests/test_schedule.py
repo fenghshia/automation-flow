@@ -119,7 +119,7 @@ class InterruptedMissionRecoveryTests(unittest.TestCase):
         source = source_directory / "example.mp4"
         source.write_bytes(b"source")
         service = CompressionService(root, output_directory, cache_directory)
-        service.validate_output = Mock(return_value=None)
+        service.validate_deliverable = Mock(return_value=None)
         mission = SimpleNamespace(
             id=7,
             source_path=str(source.resolve()),
@@ -136,6 +136,7 @@ class InterruptedMissionRecoveryTests(unittest.TestCase):
         ) as query, patch.object(
             schedule_module.db.session, "commit"
         ) as commit, patch("builtins.print"):
+            query.filter.return_value = query
             query.filter_by.return_value.order_by.return_value.first.return_value = (
                 mission
             )
@@ -244,7 +245,7 @@ class InterruptedMissionRecoveryTests(unittest.TestCase):
             self.assertEqual(CompressionStatus.COMPLETED, mission.status)
             self.assertFalse(source.exists())
             self.assertTrue(output.exists())
-            service.validate_output.assert_called_once_with(output)
+            service.validate_deliverable.assert_called_once_with(output)
 
     def test_cleanup_validation_failure_preserves_source_and_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -254,7 +255,7 @@ class InterruptedMissionRecoveryTests(unittest.TestCase):
             output = service.destination_for(mission.file_name)
             mission.output_path = str(output)
             output.write_bytes(b"invalid")
-            service.validate_output.side_effect = RuntimeError("invalid output")
+            service.validate_deliverable.side_effect = RuntimeError("invalid output")
 
             self.run_recovery(
                 schedule_module.finish_cleanup_pending,
