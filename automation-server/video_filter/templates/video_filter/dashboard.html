@@ -1,0 +1,9 @@
+{% extends 'dashboard/base.html' %}
+{% block title %}视频偏好筛选{% endblock %}
+{% block breadcrumb %}视频偏好筛选{% endblock %}
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">VIDEO FILTER</div><h1>视频偏好筛选</h1><p>查看摘要提取、训练进度，以及两个模型在真实反馈中的表现。</p></div><div class="refresh-controls"><span id="refresh-status" aria-live="polite">每 5 秒刷新</span><button id="refresh-now" type="button">立即刷新</button><button id="toggle-refresh" type="button" aria-pressed="false">暂停</button></div></div>
+<div class="refresh-line">最近更新 <span id="last-refresh">等待更新</span><span id="refresh-error" role="status"></span></div>
+<section id="service-snapshot" data-refresh-url="{{ url_for('video_filter_dashboard.fragment', group=request.args.get('group')) }}">{% include 'video_filter/_snapshot.html' %}</section>
+<noscript><div class="notice">自动刷新需要 JavaScript。当前数据已由 Flask 渲染，可手动刷新浏览器查看最新状态。</div></noscript>
+{% endblock %}

@@ -1,0 +1,60 @@
+{% macro pct(value) -%}{% if value is number %}{{ '%.1f'|format(value * 100) }}%{% else %}—{% endif %}{%- endmacro %}
+{% macro metric(label, value, caption) -%}<div class="stat-card"><div class="stat-label">{{ label }}</div><div class="stat-value">{{ value }}</div><div class="stat-caption">{{ caption }}</div></div>{%- endmacro %}
+<div class="snapshot-body" data-updated-at="{{ view.updated_at }}">
+{% if view.grouped %}
+<p class="muted">提取准入 {{ view.resources.extract_active }} · 等待 {{ view.resources.extract_waiting }} · GPU 独占运行 {{ view.resources.exclusive_active }} · 独占等待 {{ view.resources.exclusive_waiting }} · 资源冲突 {{ view.resources.conflicts }}</p>
+<div class="panel"><h2>分组</h2><nav>{% for group in view.groups %}<a class="badge {{ 'positive' if group.name == view.group_name else 'neutral' }}" href="{{ url_for('video_filter_dashboard.index', group=group.name) }}">{{ group.name }} · {{ '已初始化' if group.initialized else '等待首次扫描' }}</a> {% endfor %}</nav><p>配置并发 {{ view.resources.configured_concurrency }} · 实际上限 {{ view.resources.effective_concurrency or view.resources.configured_concurrency }}</p></div>
+<div class="stats-grid">{% for task in view.global_running %}<article class="panel"><span class="badge neutral">{{ task.group_name }}</span><h3>{{ task_names.get(task.kind, task.kind) }}</h3><p class="file-name">{{ task.file_name or task.id[:8] }}</p><p>{{ task.progress.stage if task.progress else '执行中' }}{% if task.progress and task.progress.modality %} · {{ task.progress.modality }}{% endif %}</p><p>{{ task.elapsed or 0 }} 秒 · {{ task.id[:8] }}</p>{% if task.progress and task.progress.percent is number %}<div class="progress-track"><div class="progress-fill" style="width: {{ task.progress.percent }}%"></div></div>{% endif %}</article>{% endfor %}</div>
+{% endif %}
+{% if view.error_code %}
+<div class="notice danger" role="status"><strong>{{ '配置暂不可用' if view.error_code == 'invalid_configuration' else '数据库数据暂不可用' }}</strong><p>{{ '请检查本地环境配置及 error.log。' if view.error_code == 'invalid_configuration' else '请确认数据库可连接、已完成所需迁移，并检查 error.log。' }} 页面将继续刷新。</p></div>
+{% elif not view.enabled %}
+<div class="panel empty"><span class="badge neutral">尚未启用</span><h2>视频筛选服务尚未开启</h2><p>完成本地配置后设置 VIDEO_FILTER_ENABLED=true，并重启主服务。</p></div>
+{% elif view.grouped and not view.group_name %}
+<div class="panel"><p>选择分组查看该组的摘要、独立模型和实际准确率。</p></div>
+{% else %}
+{% set counts = view.counts %}
+<div class="status-strip"><div><span class="status-dot"></span>服务已启用 <span class="badge {{ 'positive' if view.automatic_processing else 'neutral' }}">{{ '自动分类已开启' if view.automatic_processing else ('等待所选模型' if view.transfer_enabled else '仅分析与记录预测') }}</span></div><span>分类采用 <strong>{{ model_names.get(view.selected_classifier, view.selected_classifier) }}</strong></span></div>
+{% if not view.model_manifest_configured or false in view.role_accessible.values() %}<div class="notice warning">模型清单尚未配置，或有受管目录不可访问。相关任务会等待配置恢复。</div>{% endif %}
+{% if counts.tracking_conflicts or counts.transfer_conflicts or view.feedback_journal_pending %}<div class="notice warning">存在 {{ counts.tracking_conflicts }} 个文件追踪冲突、{{ counts.transfer_conflicts }} 个搬运冲突、{{ view.feedback_journal_pending }} 条待处理反馈。请结合运行日志核对。</div>{% endif %}
+<div class="stats-grid">
+  {{ metric('当前视频版本', counts.present_variants, '按编码版本计数，相同文件副本去重') }}
+  {{ metric('摘要已完成', counts.summarized_present_variants, '当前仍在目录中，且使用当前特征版本') }}
+  {{ metric('排队任务', counts.queued_tasks, counts.running_tasks|string + ' 个任务进行中') }}
+  {{ metric('失败任务', counts.failed_tasks, '累计失败记录，可通过任务 ID 排查') }}
+</div>
+<div class="two-column">
+  <article class="panel"><div class="panel-heading"><h2>特征摘要覆盖</h2><span class="badge neutral">数据库存储</span></div><div class="coverage-number">{{ pct(view.summary_coverage) }}<span>{{ counts.summarized_present_variants }} / {{ counts.present_variants }} 个版本</span></div><div class="progress-track"><div class="progress-fill" style="width: {{ (view.summary_coverage or 0) * 100 }}%"></div></div><p class="muted">覆盖率以已提交并校验可读的摘要为准，单个提取阶段完成不会提前计入。</p><div class="sample-row"><div><span class="muted">可训练的喜欢样本</span><strong>{{ counts.trainable_positive_assets }}</strong></div><div><span class="muted">可训练的不喜欢样本</span><strong>{{ counts.trainable_negative_assets }}</strong></div></div><div class="panel-foot">{% if counts.trainable_positive_assets >= 10 and counts.trainable_negative_assets >= 10 %}已达到每类至少 10 个样本的训练门槛{% else %}训练等待：每类至少 10 个有完整摘要的确认样本{% endif %}</div></article>
+  <article class="panel"><div class="panel-heading"><h2>当前任务</h2>{% if view.current_task %}<span class="badge positive">进行中</span>{% else %}<span class="badge neutral">空闲</span>{% endif %}</div>
+  {% if view.current_task %}{% set task = view.current_task %}{% set progress = task.progress %}
+    <h3>{{ task_names.get(task.kind, task.kind) }}{% if task.model_type %} · {{ model_names.get(task.model_type, task.model_type) }}{% endif %}</h3>
+    <p class="file-name" title="{{ task.file_name or task.id }}">{{ task.file_name or '任务 ' + task.id[:8] }}</p>
+    <div class="progress-label"><span>{{ progress.stage if progress else '正在执行，尚无细分进度' }}{% if progress and progress.modality %} · {{ progress.modality|upper }}{% endif %}</span><strong>{% if progress and progress.percent is number %}{{ '%.1f'|format(progress.percent) }}%{% else %}进行中{% endif %}</strong></div>
+    <div class="progress-track"><div class="progress-fill {{ 'indeterminate' if not progress or progress.percent is not number }}" {% if progress and progress.percent is number %}style="width: {{ progress.percent }}%"{% endif %}></div></div>
+    <p class="muted">{% if progress and progress.completed is defined %}当前阶段窗口 {{ progress.completed }} / {{ progress.total|default('—') }}{% elif progress and progress.epoch is defined %}训练轮次 {{ progress.epoch }} / {{ progress.epochs|default('—') }}{% if progress.validation_loss is number %} · 验证损失 {{ '%.5f'|format(progress.validation_loss) }}{% endif %}{% else %}此阶段未提供百分比{% endif %} · 任务已运行 {{ task.elapsed or 0 }} 秒</p>
+    {% if progress %}<p class="muted">进度报告于 <time data-local-time datetime="{{ progress.updated_at }}">{{ progress.updated_at }}</time></p>{% endif %}
+    <div class="panel-foot">任务 ID <code>{{ task.id }}</code> · 百分比表示当前阶段，不代表整项任务完成</div>
+  {% else %}<div class="idle-state"><span class="idle-icon">✓</span><h3>暂无正在执行的任务</h3><p>等待下一轮扫描、任务入队或所需样本就绪。</p></div>{% endif %}
+  </article>
+</div>
+<div class="section-heading"><div><h2>两个模型，分别衡量</h2><p>共同样本使用同一批用户反馈；验证指标单独展示。</p></div><span class="badge neutral">共同反馈 {{ view.actual_accuracy.paired.reviewed_assets }} 个资产</span></div>
+<div class="two-column">
+{% for kind in ('logistic_regression', 'mil') %}
+  {% set model = view.models.get(kind) %}{% set actual = view.actual_accuracy.models[kind] %}{% set paired = view.actual_accuracy.paired[kind] %}
+  <article class="panel model-card {{ 'selected-model' if kind == view.selected_classifier }}"><div class="panel-heading"><h2>{{ model_names[kind] }}</h2><span class="badge {{ 'positive' if kind == view.selected_classifier else 'neutral' }}">{{ '分类采用' if kind == view.selected_classifier else '同时预测' }}</span></div>
+    <div class="model-state">{% if model %}<span class="status-dot {{ 'amber' if not model.feature_compatible }}"></span>{{ '活动版本已就绪' if model.feature_compatible else '活动版本与当前特征不匹配' }} · <code>{{ model.id[:8] }}</code>{% else %}<span class="status-dot gray"></span>尚无通过验证的活动版本{% endif %}</div>
+    {% if model and model.hyperparameters %}<details><summary>训练配置 {{ (model.training_config_digest or '')[:12] }}</summary><div class="muted" style="overflow-wrap:anywhere">{{ model.hyperparameters|tojson }}</div></details>{% endif %}
+    <div class="model-score"><div><span class="muted">共同样本实际准确率</span><strong>{{ pct(paired.accuracy) }}</strong></div><div><span class="muted">不喜欢预测精确率</span><strong>{{ pct(paired.dislike_precision) }}</strong></div></div>
+    <div class="progress-track"><div class="progress-fill {{ 'blue' if kind == 'mil' }}" style="width: {{ (paired.accuracy or 0) * 100 }}%"></div></div>
+    <dl class="model-details"><div><dt>全部合格反馈</dt><dd>{{ actual.reviewed_assets }} 个 · {{ pct(actual.accuracy) }}</dd></div><div><dt>共同样本误判喜欢 / 不喜欢</dt><dd>{{ paired.confusion.false_like }} / {{ paired.confusion.false_dislike }}</dd></div><div><dt>共同样本 95% 区间</dt><dd>{% if paired.accuracy_wilson_95 %}{{ pct(paired.accuracy_wilson_95[0]) }} – {{ pct(paired.accuracy_wilson_95[1]) }}{% else %}—{% endif %}</dd></div><div><dt>活动版本验证 balanced accuracy</dt><dd>{{ pct(model.validation.balanced_accuracy if model and model.validation else none) }}</dd></div><div><dt>活动版本分类阈值</dt><dd>{{ '%.3f'|format(model.threshold) if model else '—' }}</dd></div></dl>
+    <div class="panel-foot">{% if not paired.reviewed_assets %}暂无共同用户反馈，不能据此判断哪个模型更准。{% else %}实际结果来自后续删除或确认喜欢；不含训练与验证样本。{% endif %}</div>
+  </article>
+{% endfor %}
+</div>
+<article class="panel table-panel"><div class="panel-heading"><h2>最近任务</h2><span class="muted">最多 20 条，进行中任务优先</span></div><div class="table-wrap"><table><thead><tr><th>任务 / 视频</th><th>类型</th><th>状态</th><th>耗时</th><th>错误代码</th><th>创建时间</th></tr></thead><tbody>
+{% for task in view.tasks %}<tr><td><span class="table-file" title="{{ task.file_name or task.id }}">{{ task.file_name or '任务 ' + task.id[:8] }}</span><code class="task-id" title="{{ task.id }}">{{ task.id[:8] }}</code></td><td>{{ task_names.get(task.kind, task.kind) }}{% if task.model_type %}<small>{{ model_names.get(task.model_type, task.model_type) }}</small>{% endif %}</td><td><span class="badge {{ 'danger' if task.status == 'failed' else ('positive' if task.status in ('running', 'succeeded') else 'neutral') }}">{{ state_names.get(task.status, task.status) }}</span></td><td>{{ task.elapsed|string + ' 秒' if task.elapsed is not none else '—' }}</td><td><code>{{ task.error_code or '—' }}</code></td><td><time data-local-time datetime="{{ task.created_at }}">{{ task.created_at }}</time></td></tr>{% else %}<tr><td colspan="6" class="empty">暂无任务记录</td></tr>{% endfor %}
+</tbody></table></div></article>
+<article class="panel table-panel"><div class="panel-heading"><h2>模型版本实际成绩</h2><span class="muted">最近 10 个版本</span></div><div class="table-wrap"><table><thead><tr><th>模型 / 版本</th><th>状态</th><th>反馈资产</th><th>实际准确率</th><th>不喜欢预测精确率</th></tr></thead><tbody>{% for run in view.actual_accuracy.versions[:10] %}<tr><td>{{ model_names.get(run.model_type, run.model_type) }} <code title="{{ run.model_id }}">{{ run.model_id[:8] }}</code></td><td>{{ state_names.get(run.status, run.status) }}</td><td>{{ run.reviewed_assets }}</td><td>{{ pct(run.accuracy) }}</td><td>{{ pct(run.dislike_precision) }}</td></tr>{% else %}<tr><td colspan="5" class="empty">暂无模型版本。等待样本与训练完成。</td></tr>{% endfor %}</tbody></table></div></article>
+<div class="snapshot-foot"><span>最近扫描：{% if view.last_scan %}<time data-local-time datetime="{{ view.last_scan.at }}">{{ view.last_scan.at or '尚未结束' }}</time> · {{ '完整' if view.last_scan.complete else '未完整，删除判定暂停' }}{% else %}暂无记录{% endif %}</span><span>完整错误堆栈保存在 video_filter/logs/error.log</span></div>
+{% endif %}
+</div>
