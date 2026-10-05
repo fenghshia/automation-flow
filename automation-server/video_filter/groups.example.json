@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "groups": [
+    {
+      "name": "example_group",
+      "enabled": true,
+      "directories": {
+        "unclassified": "private/example-media/unclassified",
+        "liked": "private/example-media/liked",
+        "predicted_like": "private/example-media/predicted-like",
+        "predicted_dislike": "private/example-media/predicted-dislike",
+        "liked_source": "private/example-media/liked-source"
+      },
+      "classifier": "logistic_regression",
+      "transfer_enabled": false,
+      "compression_enabled": false,
+      "training": {
+        "minimum_per_class": 10,
+        "seed": 1729,
+        "validation_fraction": 0.3,
+        "activation_balanced_accuracy": 0.6,
+        "activation_roc_auc": 0.6,
+        "logistic_regression": {"C": 0.1, "max_iter": 2000, "class_weight": "balanced"},
+        "mil": {
+          "epochs": 60, "patience": 8, "max_train_windows": 512,
+          "learning_rate": 0.0003, "weight_decay": 0.001, "dropout": 0.2,
+          "encoder_width": 128, "attention_width": 64
+        }
+      }
+    }
+  ]
+}

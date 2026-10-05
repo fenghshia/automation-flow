@@ -1,0 +1,8 @@
+# Tested on Windows, Python 3.14, RTX 3060 Ti. Install torch from its CUDA index.
+timm==1.0.30
+transformers==5.18.0
+opensmile==2.6.0
+scikit-learn==1.9.1
+Pillow==12.3.0
+# CUDA wheels used: torch==2.11.0+cu128, torchvision==0.26.0+cu128,
+# torchaudio==2.11.0+cu128 (https://download.pytorch.org/whl/cu128).
