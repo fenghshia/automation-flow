@@ -28,6 +28,14 @@ class EnvConfig:
         "IMAGE_COMPRESSION_SOURCE_DIR",
         "IMAGE_COMPRESSION_OUTPUT_DIR",
         "IMAGE_COMPRESSION_7ZIP_BIN_DIR",
+        "VIDEO_FILTER_CONFIRMED_LIKE_DIR",
+        "VIDEO_FILTER_PREDICTED_LIKE_DIR",
+        "VIDEO_FILTER_PREDICTED_DISLIKE_DIR",
+        "VIDEO_FILTER_UNCLASSIFIED_DIR",
+        "VIDEO_FILTER_STATE_DIR",
+        "VIDEO_FILTER_MODEL_MANIFEST",
+        "VIDEO_FILTER_GROUPS_CONFIG",
+        "VIDEO_FILTER_FFMPEG_BIN_DIR",
     )
 
     @classmethod
@@ -176,3 +184,145 @@ class EnvConfig:
     @classmethod
     def image_compression_7zip_bin_directory(cls):
         return cls._required_directory("IMAGE_COMPRESSION_7ZIP_BIN_DIR")
+
+    @classmethod
+    def _boolean(cls, name, default=False):
+        cls._load()
+        value = os.getenv(name, "true" if default else "false").strip().lower()
+        if value not in ("true", "false", "1", "0"):
+            raise RuntimeError(f"{name} must be true, false, 1 or 0.")
+        return value in ("true", "1")
+
+    @classmethod
+    def video_filter_enabled(cls):
+        return cls._boolean("VIDEO_FILTER_ENABLED")
+
+    @classmethod
+    def video_filter_ffmpeg_bin_directory(cls, required=True):
+        cls._load()
+        for name in ("VIDEO_FILTER_FFMPEG_BIN_DIR", "VIDEO_COMPRESSION_FFMPEG_BIN_DIR"):
+            if os.getenv(name):
+                return cls._required_directory(name)
+        if required:
+            raise RuntimeError("VIDEO_FILTER_FFMPEG_BIN_DIR must be set.")
+        return None
+
+    @classmethod
+    def _legacy_video_filter_settings(cls):
+        """Validate without creating directories, loading weights or scanning videos."""
+        if not cls.video_filter_enabled():
+            return {"enabled": False}
+        names = {
+            "confirmed_like": "VIDEO_FILTER_CONFIRMED_LIKE_DIR",
+            "predicted_like": "VIDEO_FILTER_PREDICTED_LIKE_DIR",
+            "predicted_dislike": "VIDEO_FILTER_PREDICTED_DISLIKE_DIR",
+            "unclassified": "VIDEO_FILTER_UNCLASSIFIED_DIR",
+            "compressed_like": "VIDEO_COMPRESSION_OUTPUT_DIR",
+        }
+        directories = {role: cls._required_directory(name) for role, name in names.items()}
+        state_directory = cls._required_directory("VIDEO_FILTER_STATE_DIR")
+        lineage_enabled = cls._boolean("VIDEO_FILTER_LINEAGE_ENABLED")
+        compression_source = cls.video_compression_source_directory() if lineage_enabled else None
+        paths = {**directories, "state": state_directory}
+        if compression_source is not None:
+            def same_directory(first, second):
+                return first == second or (first.exists() and second.exists() and first.samefile(second))
+
+            if same_directory(compression_source, directories["compressed_like"]):
+                raise RuntimeError("Compression source and output must be separate directories.")
+            if not any(same_directory(compression_source, path) for path in directories.values()):
+                paths["compression_source"] = compression_source
+        items = list(paths.items())
+        for index, (role, path) in enumerate(items):
+            if path.exists() and not path.is_dir():
+                raise RuntimeError(f"video_filter {role} must be a directory.")
+            for other_role, other_path in items[index + 1:]:
+                overlap = path == other_path or path in other_path.parents or other_path in path.parents
+                if path.exists() and other_path.exists():
+                    overlap = overlap or path.samefile(other_path)
+                if overlap:
+                    raise RuntimeError(f"video_filter roles overlap: {role}, {other_role}.")
+        timing = {}
+        for suffix, default in (
+            ("SCAN_INTERVAL_SECONDS", 60), ("STABLE_SECONDS", 60),
+            ("MISSING_SECONDS", 300), ("TASK_TIMEOUT_SECONDS", 1800),
+            ("BATCH_SIZE", 1),
+        ):
+            name = "VIDEO_FILTER_" + suffix
+            try:
+                value = int(os.getenv(name, str(default)))
+            except ValueError as error:
+                raise RuntimeError(f"{name} must be a positive integer.") from error
+            if value <= 0:
+                raise RuntimeError(f"{name} must be a positive integer.")
+            timing[suffix.lower()] = value
+        device = os.getenv("VIDEO_FILTER_DEVICE", "cuda:0")
+        if device != "cpu" and not (device.startswith("cuda:") and device[5:].isdigit()):
+            raise RuntimeError("VIDEO_FILTER_DEVICE must be cpu or cuda:<index>.")
+        classifier = os.getenv("VIDEO_FILTER_CLASSIFIER", "logistic_regression")
+        if classifier not in ("logistic_regression", "mil"):
+            raise RuntimeError("VIDEO_FILTER_CLASSIFIER must be logistic_regression or mil.")
+        mil_settings = {}
+        for suffix, default in (("EPOCHS", 60), ("PATIENCE", 8), ("MAX_TRAIN_WINDOWS", 512)):
+            name = "VIDEO_FILTER_MIL_" + suffix
+            try:
+                value = int(os.getenv(name, str(default)))
+            except ValueError as error:
+                raise RuntimeError(f"{name} must be a positive integer.") from error
+            if value <= 0:
+                raise RuntimeError(f"{name} must be a positive integer.")
+            mil_settings["mil_" + suffix.lower()] = value
+        manifest = (
+            cls._required_directory("VIDEO_FILTER_MODEL_MANIFEST")
+            if os.getenv("VIDEO_FILTER_MODEL_MANIFEST") else None
+        )
+        return {
+            "enabled": True, "directories": directories, "state_directory": state_directory,
+            "model_manifest": manifest, "device": device, "classifier": classifier,
+            **mil_settings,
+            "ffmpeg_directory": cls.video_filter_ffmpeg_bin_directory(required=False),
+            "lineage_enabled": lineage_enabled,
+            "transfer_enabled": cls._boolean("VIDEO_FILTER_TRANSFER_ENABLED"),
+            "deletion_feedback_enabled": cls._boolean("VIDEO_FILTER_DELETION_FEEDBACK_ENABLED"),
+            **timing,
+        }
+
+    @classmethod
+    def video_filter_settings(cls, ignore_scope=False):
+        from video_filter.scope import current_scope
+        scope = current_scope()
+        if scope is not None and not ignore_scope:
+            return scope["settings"]
+        if not cls.video_filter_enabled():
+            return {"enabled": False}
+        cls._load()
+        if not os.getenv("VIDEO_FILTER_GROUPS_CONFIG"):
+            # Legacy fixtures remain isolated; runtime never falls back to old roots.
+            import sys
+            if getattr(sys.modules.get("app"), "_video_filter_test_app", False):
+                return cls._legacy_video_filter_settings()
+            raise RuntimeError("VIDEO_FILTER_GROUPS_CONFIG is required for grouped operation.")
+        from video_filter.group_config import anchored, load_groups
+        try:
+            shared = {"enabled": True, "grouped": True,
+                "state_directory": anchored(os.getenv("VIDEO_FILTER_STATE_DIR", "video_filter/state"), cls._project_dir),
+                "model_manifest": anchored(os.environ["VIDEO_FILTER_MODEL_MANIFEST"], cls._project_dir) if os.getenv("VIDEO_FILTER_MODEL_MANIFEST") else None,
+                "device": os.getenv("VIDEO_FILTER_DEVICE", "cuda:0"),
+                "ffmpeg_directory": cls.video_filter_ffmpeg_bin_directory(required=False)}
+            if shared["device"] != "cpu" and not (shared["device"].startswith("cuda:") and shared["device"][5:].isdigit()):
+                raise ValueError("invalid_device")
+            for suffix, default in (("SCAN_INTERVAL_SECONDS", 60), ("STABLE_SECONDS", 60), ("MISSING_SECONDS", 300),
+                ("TASK_TIMEOUT_SECONDS", 1800), ("BATCH_SIZE", 1), ("EXTRACT_CONCURRENCY", 6), ("WORKER_CPU_THREADS", 1)):
+                value = int(os.getenv("VIDEO_FILTER_" + suffix, default))
+                if value <= 0 or (suffix == "EXTRACT_CONCURRENCY" and value > 64):
+                    raise ValueError("invalid_positive_runtime_parameter")
+                shared[suffix.lower()] = value
+            path = anchored(os.environ["VIDEO_FILTER_GROUPS_CONFIG"], cls._project_dir)
+            from video_filter.observability import redact_paths
+            redact_paths([path, shared["state_directory"], shared.get("model_manifest"), shared.get("ffmpeg_directory")])
+            groups = load_groups(path, cls._project_dir, shared)
+            for group in groups:
+                redact_paths(group["directories"].values())
+            return {**shared, "groups": groups}
+        except (ValueError, OSError, KeyError) as error:
+            raise RuntimeError("Invalid video_filter group configuration.") from error

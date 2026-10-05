@@ -3,6 +3,9 @@ from iwara import *
 from jd_auto_match import *
 from video_compression import *
 from image_compression import *
+from video_filter import register_video_filter
+
+register_video_filter()
 
 
 def run():

@@ -19,3 +19,9 @@ automation-server/.env
 automation-server/private/
 automation-server/jd_auto_match/jl.md
 automation-server/iwara/browser-plugin/code/.amo-upload-uuid
+
+# Local video_filter data, weights and private test media
+automation-server/video_filter/state/
+automation-server/video_filter/weights/
+*.mp4
+.playwright-mcp/

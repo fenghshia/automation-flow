@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}运行概览{% endblock %} · Automation Flow</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('dashboard.static', filename='favicon.svg') }}">
+  <link rel="stylesheet" href="{{ url_for('dashboard.static', filename='dashboard.css') }}">
+  <script src="{{ url_for('dashboard.static', filename='dashboard.js') }}" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="{{ url_for('dashboard.index') }}"><span class="brand-icon">AF</span><span>Automation<span class="brand-sub">FLOW / 本地工作台</span></span></a>
+    <div class="nav-label">工作台</div>
+    <nav aria-label="服务导航">
+      <a class="nav-item {{ 'active' if active_service == 'overview' }}" href="{{ url_for('dashboard.index') }}"><span class="nav-dot"></span>运行概览</a>
+      <div class="nav-label">服务</div>
+      {% for service in dashboard_services %}
+      <a class="nav-item {{ 'active' if active_service == service.key }}" href="{{ url_for(service.endpoint) }}"><span class="nav-dot"></span>{{ service.title }}</a>
+      {% endfor %}
+    </nav>
+    <div class="sidebar-foot"><span class="status-dot"></span> 本地服务<span>Flask · 自动化流水线</span></div>
+  </aside>
+  <main class="main">
+    <header class="topbar"><span>工作台 / {% block breadcrumb %}运行概览{% endblock %}</span><span class="badge neutral">本地运行</span></header>
+    <div class="content">{% block content %}{% endblock %}</div>
+    <footer>Automation Flow <span>数据来自当前服务 · 页面仅展示运行状态</span></footer>
+  </main>
+</body>
+</html>

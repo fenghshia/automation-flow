@@ -16,6 +16,8 @@
 | --- | --- |
 | `automation-server/**` | `.agents/automation-server.md` |
 | `automation-server/<project_name>/**` | `.agents/subproject.md` |
+| `automation-server/video_compression/**` | `.agents/video-compression.md` |
+| `plan/video_compression/**` | `.agents/video-compression.md` |
 | `automation-server/<project_name>/browser-plugin/**` | `.agents/firefox-browser-plugin.md` |
 | `automation-server/<project_name>/tampermonkey/**` | `.agents/tampermonkey.md` |
 | 配置、凭据、日志、样例数据、Git 初始化、提交或 GitHub 发布 | `.agents/public-repository-safety.md` |

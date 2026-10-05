@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 PROJECT_NAMES = (
     "image_compression",
     "video_compression",
+    "video_filter",
     "iwara",
     "jd_auto_match",
     "vps_data_backup",
@@ -105,7 +106,14 @@ class SafeFormatter(logging.Formatter):
     """Format complete records and mask known secret-shaped values."""
 
     def format(self, record: logging.LogRecord) -> str:
-        return _redact(super().format(record))
+        text = super().format(record)
+        if record.name.startswith("video_filter"):
+            # Inspect an already imported context; logging must not import ORM/Flask.
+            scope_module = sys.modules.get("video_filter.scope")
+            scope = scope_module.current_scope() if scope_module else None
+            if scope:
+                text += " | group=" + scope["settings"]["name"] + " | dataset_group_id=" + scope["id"] + " | epoch=" + scope["epoch"]
+        return _redact(text)
 
 
 class ContextFilter(logging.Filter):

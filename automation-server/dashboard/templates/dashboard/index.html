@@ -1,0 +1,10 @@
+{% extends 'dashboard/base.html' %}
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">AUTOMATION FLOW</div><h1>运行概览</h1><p>在一个工作台里，查看本地流水线的运行情况。</p></div><span class="badge neutral">{{ dashboard_services|length }} 个服务面板</span></div>
+<div class="service-grid">
+  {% for service in dashboard_services %}
+  <a class="service-card" href="{{ url_for(service.endpoint) }}"><div class="eyebrow">{{ service.key }}</div><h2>{{ service.title }}</h2><p>{{ service.description }}</p><span class="service-link">查看运行状态 <span aria-hidden="true">↗</span></span></a>
+  {% else %}<div class="panel empty">暂无接入的服务面板。</div>{% endfor %}
+</div>
+<div class="extension-note"><span class="note-icon">＋</span><div><strong>更多流水线，可以逐步接入</strong><p>服务共用工作台导航与页面布局，分别展示自己的任务和指标。</p></div></div>
+{% endblock %}
