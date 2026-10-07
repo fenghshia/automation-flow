@@ -1,5 +1,6 @@
 import io
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -9,6 +10,12 @@ from video_compression.transcoder import TranscodeError, build_ffmpeg_command, t
 
 
 class TranscoderTests(unittest.TestCase):
+    def setUp(self):
+        # Encoder unit tests must not consult local config, DB or NVIDIA tools.
+        admission = patch("media_lineage.integration.compression_gpu", side_effect=lambda: nullcontext())
+        admission.start()
+        self.addCleanup(admission.stop)
+
     def test_command_is_argument_list_and_preserves_audio(self):
         plan = CompressionPlan(True, 1920, 1080, True, ("test",))
         command = build_ffmpeg_command(

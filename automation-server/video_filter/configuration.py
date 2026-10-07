@@ -24,7 +24,8 @@ def _snapshot(value):
 def record_configuration(session, settings):
     if settings.get("enabled") is not True:
         raise ValueError("Disabled configuration cannot become a scan generation.")
-    snapshot = _snapshot({"name": settings["name"], "directories": settings["directories"]} if settings.get("grouped") else settings)
+    snapshot = _snapshot({"name": settings["name"], "directories": settings["directories"]} if settings.get("grouped") else
+        {key: value for key, value in settings.items() if key != "release_gpu"})
     digest = hashlib.sha256(canonical_json(snapshot).encode("utf-8")).hexdigest()
     query = select(ConfigRevision).filter_by(signature=digest)
     existing = session.execute(query).scalar_one_or_none()

@@ -36,7 +36,7 @@ def _summaries(vectors, valid):
     return mean.astype(np.float32), np.sqrt(variance).astype(np.float32)
 
 
-def _validate_arrays(arrays, duration, audio_status):
+def _validate_arrays(arrays, duration, audio_status, audio_missing_windows=None):
     if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not np.isfinite(duration) or duration <= 0:
         raise ValueError("Invalid media duration.")
     if audio_status not in ("present", "no_audio"):
@@ -51,6 +51,12 @@ def _validate_arrays(arrays, duration, audio_status):
         raise ValueError("Windows fall outside the media duration.")
     if windows[0, 0] != 0 or windows[-1, 1] != duration or (count > 1 and not np.array_equal(windows[1:, 0], windows[:-1, 1])):
         raise ValueError("Incomplete temporal coverage.")
+    missing = [] if audio_missing_windows is None else audio_missing_windows
+    if (not isinstance(missing, list) or any(type(index) is not int or not 0 <= index < count for index in missing)
+            or missing != sorted(set(missing)) or (audio_status == "no_audio" and missing)):
+        raise ValueError("Invalid explicit missing audio windows.")
+    audio_present = np.ones(count, dtype=np.bool_)
+    audio_present[missing] = False
     expected = {"windows"}
     for name in MODALITIES:
         expected.update((name, name + "_valid", name + "_mean", name + "_std"))
@@ -66,7 +72,9 @@ def _validate_arrays(arrays, duration, audio_status):
             raise ValueError("Visual extraction must complete for every window.")
         if audio_status == "no_audio" and name in ("beats", "egemaps") and valid.any():
             raise ValueError("No-audio summaries cannot contain valid audio features.")
-        if audio_status == "present" and name == "beats" and not valid.all():
+        if name in ("beats", "egemaps") and valid[~audio_present].any():
+            raise ValueError("Missing audio windows cannot contain valid audio features.")
+        if audio_status == "present" and name == "beats" and not valid[audio_present].all():
             raise ValueError("Audio embedding extraction must complete when audio is present.")
         for suffix, value in zip(("_mean", "_std"), _summaries(vector, valid)):
             summary = arrays.get(name + suffix)
@@ -112,7 +120,7 @@ class StoredBundle:
 class FeatureStore:
     def prepare(self, *, asset_id, variant_id, source_sha256, task_id, signature,
                 source_snapshot, duration_seconds, windows, vectors, validity, audio_status,
-                dataset_group_id=None, reset_epoch=None):
+                dataset_group_id=None, reset_epoch=None, audio_missing_windows=None):
         """Serialize into memory; never write NPZ or manifest files beside videos."""
         for value in (asset_id, variant_id, task_id):
             _uuid(value)
@@ -128,7 +136,7 @@ class FeatureStore:
                 raise ValueError("Invalid feature/validity shapes.")
             arrays[name], arrays[name + "_valid"] = vector, valid
             arrays[name + "_mean"], arrays[name + "_std"] = _summaries(vector, valid)
-        count = _validate_arrays(arrays, duration_seconds, audio_status)
+        count = _validate_arrays(arrays, duration_seconds, audio_status, audio_missing_windows)
         if sum(value.nbytes for value in arrays.values()) > MAX_PAYLOAD_BYTES:
             raise ValueError("Summary exceeds the size limit.")
         output = io.BytesIO()
@@ -145,6 +153,8 @@ class FeatureStore:
         }
         if dataset_group_id is not None or reset_epoch is not None:
             manifest.update(dataset_group_id=_uuid(dataset_group_id), reset_epoch=_uuid(reset_epoch))
+        if audio_missing_windows:
+            manifest["audio_missing_windows"] = list(audio_missing_windows)
         # Isolate caller-owned dictionaries before producing a worker result.
         import json
 
@@ -155,7 +165,7 @@ class FeatureStore:
 
     def _decode(self, prepared):
         manifest, blob = prepared.manifest, prepared.arrays_blob
-        if not isinstance(manifest, dict) or set(manifest) - {"dataset_group_id", "reset_epoch"} != {
+        if not isinstance(manifest, dict) or set(manifest) - {"dataset_group_id", "reset_epoch", "audio_missing_windows"} != {
             "schema_version", "complete", "asset_id", "variant_id", "task_id",
             "source_sha256", "source_snapshot", "duration_seconds", "audio_status",
             "feature_signature", "specification", "window_count", "arrays_sha256", "modality_validity",
@@ -189,7 +199,7 @@ class FeatureStore:
                 arrays = {name: content[name] for name in content.files}
         except (OSError, zipfile.BadZipFile, EOFError) as error:
             raise ValueError("Invalid summary archive.") from error
-        count = _validate_arrays(arrays, manifest["duration_seconds"], manifest["audio_status"])
+        count = _validate_arrays(arrays, manifest["duration_seconds"], manifest["audio_status"], manifest.get("audio_missing_windows"))
         if type(manifest["window_count"]) is not int or count != manifest["window_count"] or manifest["modality_validity"] != _validity(arrays):
             raise ValueError("Window count or modality validity mismatch.")
         return arrays

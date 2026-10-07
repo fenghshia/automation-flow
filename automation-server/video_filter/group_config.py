@@ -9,6 +9,8 @@ from pathlib import Path
 ROLES = ("unclassified", "liked", "predicted_like", "predicted_dislike", "liked_source")
 SAMPLE_ROLES = frozenset(ROLES[:-1])
 TRAIN_DEFAULTS = {"minimum_per_class": 10, "seed": 1729, "validation_fraction": .3,
+    "activation_like_precision": .8, "activation_dislike_precision": .8,
+    # Accepted for compatibility with existing group JSON; no longer gates.
     "activation_balanced_accuracy": .6, "activation_roc_auc": .6,
     "logistic_regression": {"C": .1, "max_iter": 2000, "class_weight": "balanced"},
     "mil": {"epochs": 60, "patience": 8, "max_train_windows": 512,
@@ -49,7 +51,8 @@ def training(values):
             result[key] = {**default, **value}
         else:
             result[key] = value
-    numeric = [result[key] for key in ("minimum_per_class", "seed", "validation_fraction", "activation_balanced_accuracy", "activation_roc_auc")]
+    numeric = [result[key] for key in ("minimum_per_class", "seed", "validation_fraction", "activation_balanced_accuracy", "activation_roc_auc",
+                                     "activation_like_precision", "activation_dislike_precision")]
     numeric += [v for block in ("mil", "logistic_regression") for k, v in result[block].items() if k != "class_weight"]
     if any(type(v) not in (int, float) or not math.isfinite(v) for v in numeric):
         raise ValueError("invalid_numeric_hyperparameter")
@@ -61,7 +64,8 @@ def training(values):
             raise ValueError("positive_integer_hyperparameter_required")
     if result["minimum_per_class"] < 10 or not 0 < result["validation_fraction"] < 1:
         raise ValueError("invalid_training_sample_gate")
-    if any(not 0 <= result[k] <= 1 for k in ("activation_balanced_accuracy", "activation_roc_auc")):
+    if any(not 0 <= result[k] <= 1 for k in ("activation_balanced_accuracy", "activation_roc_auc",
+                                          "activation_like_precision", "activation_dislike_precision")):
         raise ValueError("invalid_activation_gate")
     lr, mil = result["logistic_regression"], result["mil"]
     if lr["C"] <= 0 or lr["class_weight"] not in (None, "balanced") or mil["learning_rate"] <= 0 or mil["weight_decay"] < 0 or not 0 <= mil["dropout"] < 1:

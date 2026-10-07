@@ -18,8 +18,8 @@
         "minimum_per_class": 10,
         "seed": 1729,
         "validation_fraction": 0.3,
-        "activation_balanced_accuracy": 0.6,
-        "activation_roc_auc": 0.6,
+        "activation_like_precision": 0.8,
+        "activation_dislike_precision": 0.8,
         "logistic_regression": {"C": 0.1, "max_iter": 2000, "class_weight": "balanced"},
         "mil": {
           "epochs": 60, "patience": 8, "max_train_windows": 512,

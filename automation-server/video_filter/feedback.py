@@ -37,6 +37,7 @@ def apply_feedback(session, *, asset_id, label, expected_revision, event_key, ev
     asset = session.execute(select(Asset).where(Asset.id == asset_id).with_for_update()).scalar_one_or_none()
     if asset is None or asset.label_revision != expected_revision:
         raise FeedbackConflict("The asset changed; stale feedback cannot overwrite it.")
+    label_changed = asset.label != label
     event = FeedbackEvent(event_key=event_key, asset_id=asset_id, label=label,
                           expected_revision=expected_revision, resulting_revision=expected_revision + 1,
                           evidence=evidence)
@@ -50,11 +51,15 @@ def apply_feedback(session, *, asset_id, label, expected_revision, event_key, ev
         raise FeedbackConflict("The asset changed; stale feedback cannot overwrite it.")
     from .evaluation import record_outcomes
     record_outcomes(session, event)
-    # A newly reviewed unseen video does not invalidate either classifier.
-    # Only classifiers whose recorded dataset became stale must be retired.
-    for model in session.execute(select(ModelRun).where(ModelRun.status == "active").with_for_update()).scalars():
+    # Keep the serving version until a replacement passes validation. Repeated
+    # confirmation still records an event, but does not require model updates.
+    affected = [model.id for model in session.scalars(select(ModelRun).where(ModelRun.status == "active"))
+        if any(item["asset_id"] == asset_id for item in model.dataset_snapshot)] if label_changed else []
+    for model in session.scalars(select(ModelRun).where(ModelRun.id.in_(affected), ModelRun.status == "active")
+            .order_by(ModelRun.id).with_for_update(of=ModelRun).execution_options(populate_existing=True)) if affected else ():
         if any(item["asset_id"] == asset_id for item in model.dataset_snapshot):
-            model.status, model.active_slot = "retired", None
+            model.validation = {**(model.validation or {}), "needs_update": True,
+                                "update_reason": "training_labels_changed"}
     return event
 
 
@@ -109,7 +114,7 @@ class FeedbackJournal:
             session.rollback()
             raise
         path.unlink(missing_ok=True)
-        logger.info("用户反馈已提交 | asset_id=%s | label=%s | label_revision=%s | reason=%s | 已记录预测结果，受影响模型等待重新训练",
+        logger.info("用户反馈已提交 | asset_id=%s | label=%s | label_revision=%s | reason=%s | 已记录预测结果，标签变化时提示手动更新模型",
             event.asset_id, event.label, event.resulting_revision, event.evidence.get("reason"))
         from .evaluation import actual_metrics
         try:

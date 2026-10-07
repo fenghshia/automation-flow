@@ -55,15 +55,24 @@ def environment_report(ffmpeg_directory=None):
                 report["tools"][tool] = "unavailable"
         else:
             report["tools"][tool] = "unavailable"
+    if ffmpeg_directory:
+        executable = Path(ffmpeg_directory) / ("ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg")
+        try:
+            result = subprocess.run([str(executable), "-hide_banner", "-decoders"],
+                                    capture_output=True, text=True, timeout=15, check=True)
+            report["nvdec_decoders"] = [line.split()[1] for line in result.stdout.splitlines()
+                                         if "_cuvid" in line and len(line.split()) >= 2]
+        except (OSError, subprocess.SubprocessError):
+            report["nvdec_decoders"] = "unavailable"
     return report
 
 
-def sample_report(source, ffprobe, ffmpeg=None, decode_seconds=0):
+def sample_report(source, ffprobe, ffmpeg=None, decode_seconds=0, device="cuda:0"):
     """Report technical metadata, without emitting names, tags, or decoded media."""
     before = source.stat()
     result = subprocess.run(
         [str(ffprobe), "-v", "error", "-show_entries",
-         "format=duration,size:stream=codec_type,codec_name,width,height,sample_rate,channels",
+         "format=duration,size:stream=index,codec_type,codec_name,width,height,sample_rate,channels",
          "-of", "json", str(source)],
         capture_output=True, text=True, timeout=60, check=True,
     )
@@ -71,23 +80,18 @@ def sample_report(source, ffprobe, ffmpeg=None, decode_seconds=0):
     if decode_seconds:
         if not ffmpeg or not 0 < decode_seconds <= 10:
             raise ValueError("A local FFmpeg and a decode duration of at most 10 seconds are required.")
-        commands = {
-            "video": ["-map", "0:v:0", "-vf", "scale=224:224", "-r", "8", "-pix_fmt", "rgb24", "-f", "rawvideo"],
-            "audio": ["-map", "0:a:0", "-ac", "1", "-ar", "16000", "-f", "f32le"],
-        }
+        from .media import MediaDecoder
+        decoder = MediaDecoder(Path(ffmpeg).parent, device=device, timeout=60)
+        info = decoder.probe(source)
         report["decoded"] = {}
-        for name, options in commands.items():
+        for name in ("video", "audio"):
             if not any(stream["codec_type"] == name for stream in report["streams"]):
                 report["decoded"][name] = "no_track"
                 continue
-            decoded = subprocess.run(
-                [str(ffmpeg), "-v", "error", "-nostdin", "-i", str(source),
-                 "-t", str(decode_seconds), *options, "pipe:1"],
-                capture_output=True, timeout=60, check=True,
-            )
-            if not decoded.stdout:
-                raise RuntimeError("Media decoding produced no samples.")
-            report["decoded"][name] = {"bytes": len(decoded.stdout)}
+            duration = min(decode_seconds, info["duration_seconds"])
+            decoded = (decoder.frames(source, 0, duration, info["video_stream"], count=min(64, max(1, int(duration * 8))))
+                       if name == "video" else decoder.audio(source, 0, duration, info["audio_stream"]))
+            report["decoded"][name] = {"bytes": decoded.nbytes, "backend": "nvidia_nvdec" if name == "video" else "cpu"}
     after = source.stat()
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise RuntimeError("Sample changed during probing.")
@@ -125,7 +129,7 @@ def main():
         )
         for source in args.samples:
             try:
-                report["samples"].append(sample_report(source, executable, ffmpeg, args.decode_seconds))
+                report["samples"].append(sample_report(source, executable, ffmpeg, args.decode_seconds, device=group["device"]))
             except (OSError, subprocess.SubprocessError, RuntimeError, TypeError, ValueError) as error:
                 report["samples"].append({"error_type": type(error).__name__})
     print(json.dumps(report, ensure_ascii=True, indent=2))

@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app import app, db, scheduler
 from env import EnvConfig
 from logging_config import log_exception
-from media_lineage.integration import compression_begin, compression_published, compression_cleaned, serialized_gpu
+from media_lineage.integration import compression_begin, compression_published, compression_cleaned
 from ..models import CompressionMission, CompressionStatus
 from ..service import CompressionError, CompressionService
 from media_lineage.workflows import current_binding, workflow_scope
@@ -525,7 +525,6 @@ def recover_processing_mission(service, source_directory):
     return True
 
 
-@serialized_gpu
 def process_one_mission():
     binding = current_binding()
     source_dir = Path(binding["source_directory"]) if binding else EnvConfig.video_compression_source_directory()

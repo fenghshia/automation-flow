@@ -32,6 +32,12 @@ def _statistics(rows):
     fp = sum(row["predicted"] == 1 and row["actual"] == 0 for row in rows)
     fn = sum(row["predicted"] == 0 and row["actual"] == 1 for row in rows)
     n, correct = len(rows), tp + tn
+    labels = {}
+    for name, hits, false, missed in (("like", tp, fp, fn), ("dislike", tn, fn, fp)):
+        labels[name] = {"actual_assets": hits + missed, "predicted_assets": hits + false,
+            "correct": hits, "false_predictions": false, "missed_assets": missed,
+            "precision": hits / (hits + false) if hits + false else None,
+            "recall": hits / (hits + missed) if hits + missed else None}
     accuracy = correct / n if n else None
     interval = None
     if n:
@@ -39,12 +45,24 @@ def _statistics(rows):
         center = (accuracy + z * z / (2 * n)) / (1 + z * z / n)
         half = z * math.sqrt(accuracy * (1 - accuracy) / n + z * z / (4 * n * n)) / (1 + z * z / n)
         interval = [max(0, center - half), min(1, center + half)]
-    return {"reviewed_assets": n, "correct": correct, "accuracy": accuracy,
+    return {"reviewed_assets": n, "correct": correct, "accuracy": accuracy, "labels": labels,
         "accuracy_wilson_95": interval,
         "balanced_accuracy": ((tp / (tp + fn) + tn / (tn + fp)) / 2) if tp + fn and tn + fp else None,
         "like_precision": tp / (tp + fp) if tp + fp else None,
         "dislike_precision": tn / (tn + fn) if tn + fn else None,
         "confusion": {"true_like": tp, "true_dislike": tn, "false_like": fp, "false_dislike": fn}}
+
+
+def classification_metrics(actual, predicted):
+    return _statistics([{"actual": int(label), "predicted": int(guess)} for label, guess in zip(actual, predicted)])
+
+
+def acceptance_result(metrics, requirements):
+    checks = {name: metrics["labels"][name]["precision"] is not None and
+              metrics["labels"][name]["precision"] >= requirements[name + "_precision"]
+              for name in ("like", "dislike")}
+    return {"method": "per_label_precision", "requirements": dict(requirements),
+            "checks": checks, "passed": all(checks.values())}
 
 
 def actual_metrics(session, include_versions=True):
