@@ -1,0 +1,11 @@
+{% extends 'dashboard/base.html' %}
+{% block title %}模型训练{% endblock %}
+{% block breadcrumb %}模型训练{% endblock %}
+{% block scripts %}<link rel="stylesheet" href="{{ url_for('video_filter_dashboard.static', filename='training.css') }}"><script src="{{ url_for('video_filter_dashboard.static', filename='training.js') }}" defer></script>{% endblock %}
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">VIDEO FILTER / TRAINING</div><h1>模型训练</h1><p>查看当前模型的验证成绩，手动训练新的偏好分类器。</p></div><div class="refresh-controls"><span id="refresh-status" aria-live="polite">每 5 秒刷新</span><button id="refresh-now" type="button">立即刷新</button><button id="toggle-refresh" type="button" aria-pressed="false">暂停</button></div></div>
+<div class="refresh-line">最近更新 <span id="last-refresh">等待更新</span><span id="refresh-error" role="status"></span></div>
+<div id="training-feedback" class="notice" role="status" aria-live="polite" hidden></div>
+<section id="service-snapshot" data-refresh-url="{{ url_for('video_filter_dashboard.training_fragment', group=request.args.get('group')) }}">{% include 'video_filter/_training.html' %}</section>
+<noscript><div class="notice">手动训练与自动刷新需要 JavaScript。可刷新浏览器查看最新模型成绩。</div></noscript>
+{% endblock %}

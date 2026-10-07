@@ -1,0 +1,68 @@
+{% macro pct(value) -%}{% if value is number %}{{ '%.1f'|format(value * 100) }}%{% else %}—{% endif %}{%- endmacro %}
+{% macro auc(value) -%}{% if value is number %}{{ '%.3f'|format(value) }}{% else %}—{% endif %}{%- endmacro %}
+{% from 'video_filter/_label_metrics.html' import label_table %}
+<div class="snapshot-body" data-updated-at="{{ view.updated_at }}">
+{% if view.grouped %}
+<article class="panel"><div class="panel-heading"><h2>训练分组</h2><span class="muted">模型与样本按组独立</span></div><nav aria-label="训练分组">{% for group in view.groups %}<a class="badge {{ 'positive' if group.name == view.group_name else 'neutral' }}" href="{{ url_for('video_filter_dashboard.training', group=group.name) }}">{{ group.name }} · {{ '未启用' if not group.enabled else ('已初始化' if group.initialized else '等待首次扫描') }}</a> {% endfor %}</nav></article>
+{% endif %}
+{% if view.error_code %}
+<div class="notice danger" role="status"><strong>{{ '配置暂不可用' if view.error_code == 'invalid_configuration' else '数据库数据暂不可用' }}</strong><p>请检查本地配置、分组初始化及服务运行状态。页面将继续刷新。</p></div>
+{% elif not view.enabled %}
+<div class="panel empty"><span class="badge neutral">尚未启用</span><h2>视频筛选服务或当前分组尚未开启</h2><p>启用后可以查看验证成绩并手动训练。</p></div>
+{% elif view.grouped and not view.group_name %}
+<div class="notice">请选择要训练的分组。</div>
+{% else %}
+<div class="notice"><strong>自动模型训练已关闭，仅手动训练。</strong>验收分别检查喜欢与不喜欢的预测精确率，两类都达标才启用新版本。精确率 = 预测正确数 ÷ 预测为该标签的数量；召回率 = 预测正确数 ÷ 真实属于该标签的样本数。没有预测样本的标签不能通过验收。训练集准确率未记录；以下为验证集和用户实际反馈成绩。</div>
+<div class="two-column">
+  <div class="stat-card"><div class="stat-label">可训练的喜欢样本</div><div class="stat-value">{{ view.counts.trainable_positive_assets }}</div><div class="stat-caption">已标注且具备当前版本特征摘要</div></div>
+  <div class="stat-card"><div class="stat-label">可训练的不喜欢样本</div><div class="stat-value">{{ view.counts.trainable_negative_assets }}</div><div class="stat-caption">同一资产的多个副本不重复计数</div></div>
+</div>
+<div class="two-column">
+{% for kind in ('logistic_regression', 'mil') %}
+  {% set model = view.models.get(kind) %}
+  {% set latest = view.latest_training.get(kind) %}
+  {% set config = view.training_settings[kind] %}
+  {% set validation = model.validation if model else {} %}
+  {% set actual = view.actual_accuracy.versions|selectattr('model_id', 'equalto', model.id)|first if model else none %}
+  {% set pending = kind in view.training_pending %}
+  {% set enough = view.counts.trainable_positive_assets >= config.minimum_per_class and view.counts.trainable_negative_assets >= config.minimum_per_class %}
+  <article class="panel model-card {{ 'selected-model' if kind == view.selected_classifier }}">
+    <div class="panel-heading"><h2>{{ model_names[kind] }}</h2><span class="badge {{ 'positive' if model and model.feature_compatible else 'neutral' }}">{{ '当前分类采用' if kind == view.selected_classifier else '同时预测' }}</span></div>
+    <div class="model-state">{% if model %}当前活动模型 <code>{{ model.id[:8] }}</code> · {{ '特征版本匹配' if model.feature_compatible else '与当前特征版本不匹配' }}{% else %}尚无通过验收的活动模型{% endif %}</div>
+    {% if validation.get('needs_update') %}<div class="notice warning">训练样本标签已修正，模型需要更新，请手动训练。当前版本继续预测，等新版本通过验收后替换。</div>{% endif %}
+    <h3>当前活动版本 · 验证集分标签成绩</h3>
+    {{ label_table(validation.get('labels', {}), validation.get('acceptance')) }}
+    {% if model and not validation.get('labels') %}<p class="muted">旧版本未保存分标签验证统计，请手动训练新版本获取成绩。旧验收门槛不代表当前设置。</p>{% endif %}
+    <details><summary>整体参考指标（不参与验收）</summary><p>验证集平衡准确率 {{ pct(validation.get('balanced_accuracy')) }} · 验证集 ROC-AUC {{ auc(validation.get('roc_auc')) }}</p></details>
+    <dl class="model-details">
+      <div><dt>训练 / 验证样本</dt><dd>{{ validation.get('training_assets', '—') }} / {{ validation.get('validation_assets', '—') }}</dd></div>
+      <div><dt>当前分类阈值</dt><dd>{{ auc(model.threshold if model else none) }}</dd></div>
+      <div><dt>当前版本用户实际准确率</dt><dd>{{ pct(actual.accuracy if actual else none) }} · {{ actual.reviewed_assets if actual else 0 }} 个反馈资产</dd></div>
+      <div><dt>整体指标（仅参考）</dt><dd>平衡准确率和 AUC 不参与新版本验收</dd></div>
+    </dl>
+    <h3>当前活动版本 · 用户实际反馈</h3>{{ label_table(actual.get('labels', {}) if actual else {}) }}
+    {% if latest and (not model or latest.id != model.id) %}<div class="notice warning">最近训练结果：{{ state_names.get(latest.status, latest.status) }} · <code>{{ latest.id[:8] }}</code><p>验证平衡准确率 {{ pct(latest.validation.get('balanced_accuracy')) }} · AUC {{ auc(latest.validation.get('roc_auc')) }}</p>{{ label_table(latest.validation.get('labels', {}), latest.validation.get('acceptance')) }}{% if latest.validation.get('acceptance') and not latest.validation.acceptance.passed %}<p>两类精确率未全部达标，保留原活动版本。</p>{% endif %}</div>{% endif %}
+    <div class="panel-foot">
+      <form class="training-form" data-model-type="{{ kind }}" data-ready="{{ 'true' if enough and not pending and view.model_manifest_configured else 'false' }}" action="{{ url_for('video_filter.grouped_enqueue', group_name=view.group_name, kind='train') if view.grouped else url_for('video_filter.enqueue', kind='train') }}" method="post">
+        <fieldset class="training-thresholds" {{ 'disabled' if pending }}><legend>本次训练 · 分标签验收设置</legend>
+          <label>喜欢预测精确率至少（%）<input name="like_precision" type="number" min="0" max="100" step="0.1" required value="{{ '%.1f'|format(config.activation_like_precision * 100) }}"></label>
+          <label>不喜欢预测精确率至少（%）<input name="dislike_precision" type="number" min="0" max="100" step="0.1" required value="{{ '%.1f'|format(config.activation_dislike_precision * 100) }}"></label>
+        </fieldset>
+        <p>设置随本次训练保存。只提高门槛不会提高模型能力；修改配置文件可设置该组默认值。</p>
+        <button type="submit" disabled>{{ '训练已排队或进行中' if pending else '手动训练 ' + model_names[kind] }}</button>
+      </form>
+      <p>{% if pending %}任务结束后更新验证成绩。{% elif not enough %}每类至少需要 {{ config.minimum_per_class }} 个可训练样本。{% elif not view.model_manifest_configured %}配置模型清单后可训练。{% else %}使用当前全部可训练样本，提交后由后台执行。{% endif %}</p>
+    </div>
+  </article>
+{% endfor %}
+</div>
+<article class="panel table-panel"><div class="panel-heading"><h2>最近训练任务</h2><span class="muted">最多 20 条 · 自动刷新</span></div><div class="table-wrap"><table><thead><tr><th>模型 / 任务</th><th>状态</th><th>本次验收门槛</th><th>训练进度</th><th>耗时</th><th>错误代码</th></tr></thead><tbody>
+{% for task in view.training_tasks %}<tr data-training-task="{{ task.id }}" data-status="{{ task.status }}"><td>{{ model_names.get(task.model_type, task.model_type) }}<code class="task-id" title="{{ task.id }}">{{ task.id[:8] }}</code></td><td><span class="badge {{ 'danger' if task.status == 'failed' else ('positive' if task.status == 'running' else 'neutral') }}">{{ state_names.get(task.status, task.status) }}</span></td><td>{% if task.acceptance %}喜欢 ≥ {{ pct(task.acceptance.like_precision) }}<small>不喜欢 ≥ {{ pct(task.acceptance.dislike_precision) }}</small>{% else %}旧任务未记录{% endif %}</td><td>{% if task.progress %}{{ task.progress.stage }}{% if task.progress.epoch is number %} · 第 {{ task.progress.epoch }} / {{ task.progress.epochs or '—' }} 轮{% endif %}{% if task.progress.validation_loss is number %}<small>验证损失 {{ '%.5f'|format(task.progress.validation_loss) }}</small>{% endif %}{% else %}{{ '等待后台执行' if task.status == 'queued' else '—' }}{% endif %}</td><td>{{ task.elapsed|string + ' 秒' if task.elapsed is not none else '—' }}</td><td><code>{{ task.error_code or '—' }}</code></td></tr>{% else %}<tr><td colspan="6" class="empty">暂无训练任务</td></tr>{% endfor %}
+</tbody></table></div></article>
+<article class="panel table-panel"><div class="panel-heading"><h2>模型训练记录</h2><span class="muted">最近 20 个版本</span></div><div class="table-wrap"><table><thead><tr><th>模型 / 版本</th><th>状态</th><th>喜欢精确率 / 门槛</th><th>不喜欢精确率 / 门槛</th><th>训练 / 验证样本</th><th>训练时间</th></tr></thead><tbody>
+{% for run in view.training_history %}{% set labels = run.validation.get('labels', {}) %}{% set gate = run.validation.get('acceptance', {}).get('requirements', {}) %}<tr><td>{{ model_names.get(run.model_type, run.model_type) }}<code class="task-id" title="{{ run.id }}">{{ run.id[:8] }}</code></td><td>{{ state_names.get(run.status, run.status) }}</td><td>{{ pct(labels.get('like', {}).get('precision')) }} / {{ pct(gate.get('like_precision')) }}</td><td>{{ pct(labels.get('dislike', {}).get('precision')) }} / {{ pct(gate.get('dislike_precision')) }}</td><td>{{ run.validation.get('training_assets', '—') }} / {{ run.validation.get('validation_assets', '—') }}</td><td><time data-local-time datetime="{{ run.created_at }}">{{ run.created_at }}</time></td></tr>{% else %}<tr><td colspan="6" class="empty">暂无训练完成的模型版本</td></tr>{% endfor %}
+</tbody></table></div></article>
+<p class="muted"><a href="{{ url_for('video_filter_dashboard.index', group=view.group_name) }}">← 返回视频偏好筛选</a></p>
+<p class="muted">新增样本或标签变化不会自动训练；需要更新模型时请手动启动。新版本未通过验收时继续使用旧版本。分类阈值在验证集上选择，验证成绩不等于未来实际准确率。</p>
+{% endif %}
+</div>

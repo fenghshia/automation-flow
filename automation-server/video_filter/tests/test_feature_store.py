@@ -109,6 +109,31 @@ class FeatureStoreTests(DatabaseTestCase):
         with self.assertRaisesRegex(ValueError, "Audio embedding"):
             self.store.prepare(**absent)
 
+    def test_explicit_missing_audio_window_survives_database_roundtrip(self):
+        arguments = bundle_arguments(self.asset.id, self.variant.id)
+        for name in ("beats", "egemaps"):
+            arguments["vectors"][name][1] = 0
+            arguments["validity"][name][1] = False
+        arguments["audio_missing_windows"] = [1]
+        stored = self.store.save(db.session, self.store.prepare(**arguments))
+        ready = self.store.require_ready(db.session, stored.bundle_id)
+        self.assertEqual([1], ready.manifest["audio_missing_windows"])
+        self.assertFalse(ready.arrays["beats_valid"][1].any())
+        np.testing.assert_array_equal(ready.arrays["beats_mean"], arguments["vectors"]["beats"][0])
+
+    def test_missing_audio_evidence_cannot_hide_valid_audio_or_failed_embeddings(self):
+        for missing in ([1], [True], [2], [1, 1], [1, 0], "1"):
+            arguments = bundle_arguments(self.asset.id, self.variant.id)
+            arguments["audio_missing_windows"] = missing
+            with self.subTest(missing=missing), self.assertRaises(ValueError):
+                self.store.prepare(**arguments)
+        arguments = bundle_arguments(self.asset.id, self.variant.id)
+        arguments["audio_missing_windows"] = [1]
+        arguments["vectors"]["beats"][1] = 0
+        arguments["validity"]["beats"][1] = False
+        with self.assertRaisesRegex(ValueError, "Missing audio windows"):
+            self.store.prepare(**arguments)
+
     def test_nan_features_missing_modality_and_incomplete_windows_rejected(self):
         for change in ("nan", "missing", "windows", "visual-mask"):
             arguments = bundle_arguments(self.asset.id, self.variant.id)

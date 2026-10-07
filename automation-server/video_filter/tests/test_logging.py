@@ -24,6 +24,40 @@ def original_failure():
 
 
 class LoggingTests(DatabaseTestCase):
+    def test_performance_json_is_separate_redacted_and_has_no_media_fields(self):
+        logging_config.register_redaction_values(["fixture-secret"])
+        logging_config.log_performance("gpu_admission", task_id=str(uuid4()), free_mib=4096,
+            active_leases=[{"budget_mib": 1024, "attribution": "unknown"}], marker="fixture-secret")
+        logging_config.log_performance("unsafe", path="C:/private/fixture.mp4")
+        lines = self.contents("video_filter/logs/performance.log").splitlines()
+        self.assertEqual(1, len(lines))
+        value = json.loads(lines[0])
+        self.assertEqual(("gpu_admission", 4096, "<redacted>"),
+            (value["event"], value["free_mib"], value["marker"]))
+        self.assertIn("timestamp", value)
+        self.assertNotIn("gpu_admission", self.contents("video_filter/logs/runtime.log"))
+        self.assertNotIn("gpu_admission", self.console.getvalue())
+
+    def test_worker_performance_transport_keeps_structured_measurements(self):
+        from video_filter.observability import WorkerLogHandler
+        stream = io.StringIO()
+        handler = WorkerLogHandler(stream, "fixture-task")
+        record = logging.LogRecord("video_filter.performance", logging.INFO, __file__, 1, "modality_finished", (), None)
+        record.video_filter_performance = {"event": "modality_finished", "peak_gpu_mib": 512}
+        handler.emit(record)
+        self.assertEqual(512, json.loads(stream.getvalue())["performance"]["peak_gpu_mib"])
+
+    def test_status_summary_limits_timing_noise_and_reports_state_change(self):
+        from video_filter.observability import status_log
+        logger = MagicMock()
+        key = ("isolated", str(uuid4()))
+        with patch("video_filter.observability.time.monotonic", side_effect=[0, 1, 2, 70]):
+            status_log(logger, key, "elapsed=%s", 1., state=(1, 0))
+            status_log(logger, key, "elapsed=%s", 2., state=(1, 0))
+            status_log(logger, key, "elapsed=%s", 3., state=(2, 0))
+            status_log(logger, key, "elapsed=%s", 4., state=(2, 0))
+        self.assertEqual(3, logger.info.call_count)
+
     save_bundle = workflow.WorkflowTests.save_bundle
 
     def setUp(self):

@@ -1,0 +1,8 @@
+{% macro pct(value) -%}{% if value is number %}{{ '%.1f'|format(value * 100) }}%{% else %}—{% endif %}{%- endmacro %}
+{% macro label_table(labels, acceptance=none) -%}
+<div class="table-wrap"><table><thead><tr><th>标签</th><th>真实样本</th><th>预测数量</th><th>预测正确</th><th>预测错误</th><th>精确率</th><th>召回率</th>{% if acceptance %}<th>验收门槛</th><th>结果</th>{% endif %}</tr></thead><tbody>
+{% for key, name in (('like', '喜欢'), ('dislike', '不喜欢')) %}{% set row = labels.get(key, {}) %}
+<tr><td>{{ name }}</td><td>{{ row.get('actual_assets', '—') }}</td><td>{{ row.get('predicted_assets', '—') }}</td><td>{{ row.get('correct', '—') }}</td><td>{{ row.get('false_predictions', '—') }}</td><td>{{ pct(row.get('precision')) }}</td><td>{{ pct(row.get('recall')) }}</td>{% if acceptance %}<td>≥ {{ pct(acceptance.requirements[key + '_precision']) }}</td><td>{{ '达标' if acceptance.checks[key] else '未达标' }}</td>{% endif %}</tr>
+{% endfor %}
+</tbody></table></div>
+{%- endmacro %}

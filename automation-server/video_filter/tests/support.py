@@ -1,8 +1,10 @@
 import sys
+import os
 import tempfile
 import types
 import unittest
 from uuid import uuid4
+from unittest.mock import patch
 
 import numpy as np
 from flask import Flask
@@ -69,6 +71,14 @@ def bundle_arguments(asset_id=None, variant_id=None, no_audio=False):
 
 class DatabaseTestCase(unittest.TestCase):
     def setUp(self):
+        # Offline fixtures must not load the user's private .env/group JSON.
+        from env import EnvConfig
+        loader = patch.object(EnvConfig, "_loaded", True)
+        environment = patch.dict(os.environ, {"VIDEO_FILTER_GROUPS_CONFIG": ""})
+        loader.start()
+        environment.start()
+        self.addCleanup(loader.stop)
+        self.addCleanup(environment.stop)
         self.context = app.app_context()
         self.context.push()
         with db.engine.connect() as connection:
