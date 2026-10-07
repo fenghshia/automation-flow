@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "groups": {
+    "flat_photos": {
+      "SOURCE_DIR": "private/example-image-input-flat",
+      "OUTPUT_DIR": "private/example-image-output-flat",
+      "FLATTEN": true
+    },
+    "tree_photos": {
+      "SOURCE_DIR": "private/example-image-input-tree",
+      "OUTPUT_DIR": "private/example-image-output-tree",
+      "FLATTEN": false
+    }
+  }
+}

@@ -2,60 +2,150 @@
 
 import hashlib
 import logging
+from logging_config import log_performance
 import time
 from pathlib import Path
 from datetime import timedelta
 
 from sqlalchemy import and_, func, or_, select, update
-from .observability import log_failure as log_exception, redact_paths, progress_phase
+from .observability import log_failure as log_exception, redact_paths, progress_phase, status_log
 
 from .configuration import record_configuration
 from .feature_store import FeatureStore
 from .features.contract import canonical_json
 from .features.manifest import load_model_manifest
 from .feedback import FeedbackJournal
-from .identity import snapshot, hash_stable
+from .identity import SourceMissing, source_snapshot as snapshot, source_hash as hash_stable
 from .models import Asset, ConfigRevision, FeatureBundle, Location, ModelRun, Prediction, ScanRun, Task, TransferOperation, Variant
 from .models.records import utc_now
-from .tasks import claim_task, enqueue_task
+from .tasks import claim_task, enqueue_task, transaction_error_code
 from .model_registry import MODEL_TYPES, active_models, model_type as validate_model_type
 from .progress import extra, track_task
 
 
 logger = logging.getLogger(__name__)
+_candidate_offsets = {}
+
+
+def _pending_variants(session, config_id, signature, models=None):
+    rows = session.execute(select(Task, Asset.label_revision).join(Asset, Asset.id == Task.asset_id)
+        .where(Task.status.in_(("queued", "running")), Task.config_revision_id == config_id)).all()
+    return {task.variant_id for task, revision in rows
+        if task.input_snapshot.get("feature_signature") == signature
+        and task.input_snapshot.get("label_revision") == revision
+        and (models is None and task.kind == "extract" or models is not None and task.kind in ("predict", "classify")
+             and task.input_snapshot.get("model_ids") == {kind: run.id for kind, run in models.items()})}
+
+
+def _candidates(session, query, settings, kind):
+    if not settings.get("grouped"):
+        yield from session.execute(query.limit(20)).scalars()
+        return
+    key = (settings.get("dataset_group_id"), settings.get("reset_epoch"), kind)
+    offset = _candidate_offsets.get(key, 0)
+    rows = session.execute(query.limit(100).offset(offset)).scalars().all()
+    _candidate_offsets[key] = offset + len(rows) if len(rows) == 100 else 0
+    if len(_candidate_offsets) > 512:
+        _candidate_offsets.pop(next(iter(_candidate_offsets)))
+    yield from rows
+
+
+def _budget(session, settings, kind, default):
+    if not settings.get("grouped"):
+        return 1
+    maximum = settings.get("discovery_budget", {}).get(kind, default)
+    return max(0, maximum - session.scalar(select(func.count()).select_from(Task)
+        .where(Task.kind == kind, Task.status == "queued")))
+
+
+EXPECTED_TASK_CHANGES = {
+    "configuration_changed", "asset_feedback_changed", "feature_signature_changed",
+    "training_configuration_changed", "training_dataset_changed", "training_labels_changed",
+    "source_version_changed", "selected_classifier_changed", "transfer_disabled_or_configuration_changed",
+    "active_compatible_model_required", "current_managed_location_required", "stable_registered_source_required",
+}
+
+DEFERRED_TASK_REASONS = {"unresolved_feedback_journal"}
+
+
+def task_failure(error, attempts=None):
+    database_code = transaction_error_code(error)
+    code = database_code or ("source_missing" if isinstance(error, SourceMissing) else (
+        str(error) if isinstance(error, ValueError) and str(error).replace("_", "").isalnum() and len(str(error)) <= 64 else type(error).__name__))
+    expected = isinstance(error, SourceMissing) or (isinstance(error, ValueError) and code in EXPECTED_TASK_CHANGES)
+    if isinstance(error, ValueError) and code in DEFERRED_TASK_REASONS:
+        return "queued", code, True
+    terminal = "cancelled" if expected or (isinstance(error, ValueError) and ("changed" in code or "stale_epoch" in code)) else "failed"
+    if database_code and attempts is not None and attempts < 3:
+        terminal = "queued"
+    return terminal, code, expected
+
+
+def task_result(terminal, code):
+    changes = {"status": terminal, "error_code": code, "finished_at": utc_now()}
+    if terminal == "queued":
+        changes.update(claim_token=None, claimed_at=None, heartbeat_at=None, execution_owner=None, finished_at=None)
+        if code in DEFERRED_TASK_REASONS:
+            changes["attempts"] = Task.attempts - 1
+    return changes
+
+
+def _skip_changed_candidate(session, error, variant_id):
+    _, code, expected = task_failure(error)
+    if expected:
+        session.rollback()
+        logger.info("候选输入已变化，等待扫描或新模型后重新发现 | variant_id=%s | reason=%s", variant_id, code)
+        return True
+    return False
+
+
+def reconciliation_pending(session, settings, config_revision_id):
+    from .tracking import lineage_pending
+
+    latest = session.execute(select(ScanRun).where(ScanRun.complete == True,
+        ScanRun.config_revision_id == config_revision_id).order_by(ScanRun.created_at.desc()).limit(1)).scalar_one_or_none()
+    return latest is None or lineage_pending(session, settings, latest.lineage_watermark)
+
+
+def _extraction_baseline_ready(session, settings, config_id):
+    if not settings.get("grouped"):
+        return False
+    from .tracking import lineage_pending
+    completed = session.scalar(select(ScanRun.id).where(ScanRun.config_revision_id == config_id, ScanRun.complete == True).limit(1))
+    latest = session.scalar(select(ScanRun).where(ScanRun.config_revision_id == config_id).order_by(ScanRun.created_at.desc(), ScanRun.id.desc()).limit(1))
+    return completed is None and latest is not None and latest.role_results.get("_baseline_ready") is True and not lineage_pending(session, settings, settings.get("lineage_floor", 0))
+
+
+def _defer_reconciliation(session, error):
+    # Events can arrive between the round's initial check and task submission.
+    if isinstance(error, ValueError) and str(error) == "lineage_reconciliation_pending":
+        session.rollback()
+        logger.info("自动任务等待：文件搬运或压缩记录尚待扫描对账 | reason=lineage_reconciliation_pending")
+        return True
+    return False
 
 
 def enqueue_automatic(session, settings):
     """Discover a bounded batch; failed identical inputs wait for explicit retry."""
     if not settings.get("model_manifest") or not settings.get("ffmpeg_directory"):
-        logger.info("自动任务等待：模型清单或 FFmpeg 尚未配置")
+        status_log(logger, (settings.get("name"), "missing_tools"), "自动任务等待：模型清单或 FFmpeg 尚未配置")
         return
     signature, _ = load_model_manifest(settings["model_manifest"])
     config = record_configuration(session, settings)
     if config.active_slot != "active":
-        logger.info("自动任务等待：完整初始扫描尚未完成 | config_id=%s", config.id)
+        status_log(logger, (settings.get("name"), "baseline"), "自动任务等待：完整初始扫描尚未完成 | config_id=%s", config.id)
         return
-    from .learning import training_snapshot
-    from .training_config import effective, digest
-    data = training_snapshot(session, signature.digest)
-    enough = all(sum(row["label"] == label for row in data) >= effective(settings, "logistic_regression")["minimum_per_class"] for label in (0, 1))
-    for kind in MODEL_TYPES if enough else ():
-        latest = session.execute(select(ModelRun).where(ModelRun.model_type == kind,
-            ModelRun.feature_signature == signature.digest).order_by(ModelRun.created_at.desc(), ModelRun.id.desc()).limit(1)).scalar_one_or_none()
-        if latest is not None and latest.dataset_snapshot == data and latest.training_config_digest == digest(settings, kind):
-            continue
-        try:
-            task = enqueue(session, settings, "train", model_type=kind)
-            if task.status == "queued":
-                return
-        except ValueError as error:
-            log_exception(logger, "自动训练暂缓 | model_type=%s", error, kind)
-            session.rollback()
+    if reconciliation_pending(session, settings, config.id):
+        if _extraction_baseline_ready(session, settings, config.id):
+            _enqueue_extraction(session, settings, signature)
+            return
+        status_log(logger, (settings.get("name"), "reconciliation"), "自动任务等待：文件搬运或压缩记录尚待扫描对账 | reason=lineage_reconciliation_pending")
+        return
+    # Model training is manual. Discovery still extracts summaries and predicts.
     models = active_models(session, signature.digest)
     selected = settings.get("classifier", "logistic_regression")
     if not models:
-        logger.info("等待个人分类器 | positives=%s/10 | negatives=%s/10 | selected_classifier=%s",
-            sum(row["label"] == 1 for row in data), sum(row["label"] == 0 for row in data), selected)
+        status_log(logger, (settings.get("name"), "classifier"), "等待手动训练个人分类器 | selected_classifier=%s", selected)
         _enqueue_extraction(session, settings, signature)
         return
     if settings.get("transfer_enabled") and selected not in models:
@@ -71,8 +161,11 @@ def enqueue_automatic(session, settings):
         .join(Asset, Asset.id == Variant.asset_id).join(FeatureBundle, FeatureBundle.variant_id == Variant.id)
         .where(Location.role.in_(("unclassified", "predicted_like", "predicted_dislike")), Location.status == "present",
             Asset.label.is_(None), FeatureBundle.status == "ready", FeatureBundle.feature_signature == signature.digest,
-            or_(needs_transfer, *missing)).group_by(Variant.id).order_by(func.min(Location.created_at)).limit(20))
-    for variant_id in session.execute(candidates).scalars():
+            or_(needs_transfer, *missing)).group_by(Variant.id).order_by(func.min(Location.created_at), Variant.id))
+    if settings.get("grouped"):
+        candidates = candidates.where(Variant.id.not_in(_pending_variants(session, config.id, signature.digest, models)))
+    remaining = {kind: _budget(session, settings, kind, 4) for kind in ("predict", "classify")}
+    for variant_id in _candidates(session, candidates, settings, "prediction"):
         try:
             bundle = session.execute(select(FeatureBundle).filter_by(variant_id=variant_id,
                 feature_signature=signature.digest, status="ready")).scalar_one_or_none()
@@ -80,15 +173,28 @@ def enqueue_automatic(session, settings):
                 continue
             asset = session.get(Asset, session.get(Variant, variant_id).asset_id)
             if not prediction_complete(session, variant_id, bundle.id, asset.label_revision, models):
+                if not remaining["predict"]:
+                    continue
                 task = enqueue(session, settings, "predict", variant_id)
             elif settings.get("transfer_enabled") and selected in models and session.execute(select(Location.id).where(
                     Location.variant_id == variant_id, Location.role == "unclassified", Location.status == "present").limit(1)).first():
+                if not remaining["classify"]:
+                    continue
                 task = enqueue(session, settings, "classify", variant_id)
             else:
                 continue
             if task.status == "queued":
-                return
+                if not settings.get("grouped"):
+                    return
+                if getattr(task, "enqueue_disposition", "created") != "reused":
+                    remaining[task.kind] -= 1
+                if not any(remaining.values()):
+                    break
         except (ValueError, OSError) as error:
+            if _defer_reconciliation(session, error):
+                return
+            if _skip_changed_candidate(session, error, variant_id):
+                continue
             log_exception(logger, "分类任务无法入队 | variant_id=%s", error, variant_id)
             session.rollback()
     _enqueue_extraction(session, settings, signature)
@@ -98,22 +204,37 @@ def _enqueue_extraction(session, settings, signature):
     # Finish predictions for ready summaries before extending the extraction
     # backlog, so a folder of long videos cannot indefinitely delay evaluation.
     # PostgreSQL requires DISTINCT sort expressions in the selected columns.
-    candidates = session.execute(select(Variant.id, Variant.created_at).join(Location, Location.variant_id == Variant.id)
+    remaining = _budget(session, settings, "extract", 2 * settings.get("extract_concurrency", 6))
+    if not remaining:
+        return
+    query = (select(Variant.id, Variant.created_at).join(Location, Location.variant_id == Variant.id)
         .outerjoin(FeatureBundle, (FeatureBundle.variant_id == Variant.id) &
                    (FeatureBundle.feature_signature == signature.digest) & (FeatureBundle.status == "ready"))
         .where(Location.status == "present", Location.role != "liked_source", FeatureBundle.id.is_(None))
-        .order_by(Variant.created_at).distinct().limit(20)).scalars().all()
-    for variant_id in candidates:
+        .order_by(Variant.created_at, Variant.id).distinct())
+    if settings.get("grouped"):
+        config = record_configuration(session, settings)
+        query = query.where(Variant.id.not_in(_pending_variants(session, config.id, signature.digest)))
+    for variant_id in _candidates(session, query, settings, "extract"):
         try:
             task = enqueue(session, settings, "extract", variant_id)
             if task.status == "queued":
-                return
+                if not settings.get("grouped"):
+                    return
+                if getattr(task, "enqueue_disposition", "created") != "reused":
+                    remaining -= 1
+                if not remaining:
+                    break
         except (ValueError, OSError) as error:
+            if _defer_reconciliation(session, error):
+                return
+            if _skip_changed_candidate(session, error, variant_id):
+                continue
             log_exception(logger, "提取任务无法入队 | variant_id=%s", error, variant_id)
             session.rollback()
 
 
-def enqueue(session, settings, kind, variant_id=None, model_type=None):
+def enqueue(session, settings, kind, variant_id=None, model_type=None, *, acceptance=None):
     config = record_configuration(session, settings)
     if kind == "scan":
         # A bounded time bucket lets subsequent scans run after terminal tasks.
@@ -124,15 +245,13 @@ def enqueue(session, settings, kind, variant_id=None, model_type=None):
         return task
     if config.active_slot != "active":
         raise ValueError("complete_initial_scan_required")
-    from media_lineage.models import LineageEvent
-
-    latest = session.execute(select(ScanRun).where(ScanRun.complete == True).order_by(ScanRun.created_at.desc()).limit(1)).scalar_one_or_none()
-    if latest is None or session.execute(select(LineageEvent.id).where(LineageEvent.id > latest.lineage_watermark).limit(1)).first():
+    if reconciliation_pending(session, settings, config.id) and not (kind == "extract" and _extraction_baseline_ready(session, settings, config.id)):
         raise ValueError("lineage_reconciliation_pending")
     signature, _ = load_model_manifest(settings["model_manifest"])
     if kind == "train":
         from .learning import training_snapshot
         from .training_config import effective, digest
+        from uuid import uuid4
 
         data = training_snapshot(session, signature.digest)
         if any(sum(item["label"] == label for item in data) < effective(settings, "logistic_regression")["minimum_per_class"] for label in (0, 1)):
@@ -144,9 +263,14 @@ def enqueue(session, settings, kind, variant_id=None, model_type=None):
         pending = session.execute(select(Task).where(Task.kind == "train", Task.status.in_(("queued", "running")))).scalars()
         same = next((row for row in pending if row.input_snapshot.get("model_type") == classifier), None)
         if same:
+            if acceptance is not None and same.input_snapshot.get("acceptance") != acceptance:
+                raise ValueError("training_pending_with_different_acceptance")
             return same
+        parameters = effective(settings, classifier, acceptance=acceptance)
+        requirements = {name + "_precision": parameters["activation_" + name + "_precision"] for name in ("like", "dislike")}
         task = enqueue_task(session, kind, config.id, {"feature_signature": signature.digest, "model_type": classifier,
-            "training_config_digest": digest(settings, classifier), "hyperparameters": effective(settings, classifier),
+            "training_config_digest": digest(settings, classifier, acceptance=requirements), "hyperparameters": parameters,
+            "acceptance": requirements, "request_id": str(uuid4()),
             "dataset_digest": hashlib.sha256(canonical_json(data).encode()).hexdigest()})
     else:
         variant = session.get(Variant, variant_id)
@@ -184,9 +308,20 @@ def enqueue(session, settings, kind, variant_id=None, model_type=None):
                 selected_classifier=selected)
             if selected in models:
                 values["model_id"] = models[selected].id
+            if kind == "classify":
+                from .prediction import compatible_predictions
+                predictions = compatible_predictions(session, variant.id, bundle.id, asset.label_revision, models, stat)
+                if predictions:
+                    values["prediction_ids"] = {name: row.id for name, row in predictions.items()}
+                    values["prediction_batch_id"] = next(iter(predictions.values())).prediction_batch_id
         task = enqueue_task(session, kind, config.id, values, asset.id, variant.id)
     session.commit()
-    logger.info("任务已登记 | task_id=%s | kind=%s | status=%s | variant_id=%s", task.id, kind, task.status, variant_id or "-")
+    if settings.get("grouped") and "discovery_counts" in settings:
+        disposition = getattr(task, "enqueue_disposition", "created")
+        counts = settings["discovery_counts"]
+        counts[disposition] = counts.get(disposition, 0) + 1
+    if getattr(task, "enqueue_disposition", "created") != "reused":
+        logger.info("任务已登记 | task_id=%s | kind=%s | status=%s | disposition=%s | variant_id=%s", task.id, kind, task.status, task.enqueue_disposition, variant_id or "-")
     return task
 
 
@@ -214,26 +349,47 @@ def execute(session, settings, task):
         if existing:
             logger.info("复用已提交摘要 | task_id=%s | bundle_id=%s | variant_id=%s", task.id, existing.id, variant.id)
             return FeatureStore().require_ready(session, existing.id)
-        if hash_stable(task.input_snapshot["path"], task.input_snapshot["source_snapshot"])[0] != variant.sha256:
-            raise ValueError("source_version_changed")
         request = {**task.input_snapshot, "asset_id": variant.asset_id, "variant_id": variant.id, "task_id": task.id,
             "directory_revision_id": task.config_revision_id, "claim_token": task.claim_token,
             "batch_size": settings.get("batch_size", 1),
             **{key: str(settings[key]) for key in ("state_directory", "ffmpeg_directory", "model_manifest", "device")}}
         request.update(worker_cpu_threads=settings.get("worker_cpu_threads", 1), resource_granted=settings.get("resource_granted", False), resource_lease_id=settings.get("resource_lease_id"))
+        request["audio_cache_mib"] = settings.get("audio_cache_mib", 32)
+        request["gpu_control"] = settings.get("gpu_control")
+        request.update({key: settings[key] for key in ("persistent_workers", "worker_model_cache_mib", "worker_idle_seconds", "worker_max_tasks") if key in settings})
+        request["persistent_worker_capacity"] = settings.get("extract_concurrency", 6)
+        request["batch_sizes"] = {name: settings.get(name + "_batch_size", settings.get("batch_size", 1))
+                                  for name in ("dino", "videomae", "beats")}
+        expected_digest = variant.sha256
+        # Freeze all ORM inputs before ending the read transaction. Accessing
+        # expired task/variant attributes would reserve a connection again while
+        # the worker waits for a GPU lease in its independent parent session.
+        session.commit()
+        verified_at = time.monotonic()
+        if hash_stable(request["path"], request["source_snapshot"])[0] != expected_digest:
+            raise ValueError("source_version_changed")
+        log_performance("extraction_phase", task_id=request["task_id"], phase="parent_hash_before_worker",
+            elapsed_seconds=round(time.monotonic() - verified_at, 4))
         prepared, metadata = run_extraction(request, settings["task_timeout_seconds"])
-        logger.info("特征摘要已收到，重新校验源并入库 | task_id=%s | variant_id=%s | payload_bytes=%s", task.id, variant.id, len(prepared.arrays_blob),
-            extra=extra(task.id, "摘要核验与入库"))
-        if not (settings.get("grouped") and metadata.get("source_verified") and not Path(task.input_snapshot["path"]).exists()) and hash_stable(task.input_snapshot["path"], task.input_snapshot["source_snapshot"])[0] != variant.sha256:
+        logger.info("特征摘要已收到，重新校验源并入库 | task_id=%s | variant_id=%s | payload_bytes=%s", request["task_id"], request["variant_id"], len(prepared.arrays_blob),
+            extra=extra(request["task_id"], "摘要核验与入库"))
+        if not (settings.get("grouped") and metadata.get("source_verified") and not Path(request["path"]).exists()) and hash_stable(request["path"], request["source_snapshot"])[0] != expected_digest:
+            raise ValueError("source_version_changed")
+        variant = session.get(Variant, request["variant_id"], populate_existing=True)
+        if variant is None or variant.sha256 != expected_digest or variant.asset_id != request["asset_id"]:
             raise ValueError("source_version_changed")
         variant.media_metadata = {**metadata["media_metadata"], "extraction_measurements": metadata["measurements"]}
+        stored_at = time.monotonic()
         stored = FeatureStore().save(session, prepared)
+        log_performance("summary_committed", task_id=task.id, payload_bytes=len(prepared.arrays_blob),
+            elapsed_seconds=round(time.monotonic() - stored_at, 4))
         logger.info("特征摘要已提交并验证可读 | task_id=%s | variant_id=%s | bundle_id=%s | windows=%s", task.id, variant.id, stored.bundle_id, stored.manifest["window_count"])
         return stored
     if task.kind == "train":
         from .learning import train, training_snapshot
         from .training_config import digest
-        if task.input_snapshot.get("training_config_digest") != digest(settings, task.input_snapshot.get("model_type", "logistic_regression")):
+        acceptance = task.input_snapshot.get("acceptance")
+        if task.input_snapshot.get("training_config_digest") != digest(settings, task.input_snapshot.get("model_type", "logistic_regression"), acceptance=acceptance):
             raise ValueError("training_configuration_changed")
 
         with progress_phase(logger, "核对训练输入快照", task_id=task.id):
@@ -241,10 +397,10 @@ def execute(session, settings, task):
         if hashlib.sha256(canonical_json(data).encode()).hexdigest() != task.input_snapshot["dataset_digest"]:
             raise ValueError("training_dataset_changed")
         return train(session, signature.digest, task_id=task.id,
-            model_type=task.input_snapshot.get("model_type", "logistic_regression"), settings=settings)
+            model_type=task.input_snapshot.get("model_type", "logistic_regression"), settings=settings, acceptance=acceptance)
     if task.kind == "predict":
         from .prediction import predict_both
-        return predict_both(session, task, task.input_snapshot.get("selected_classifier", "logistic_regression"))
+        return predict_both(session, task, task.input_snapshot.get("selected_classifier", "logistic_regression"), settings=settings)
     if task.kind == "classify":
         from .transfer import classify
 
@@ -282,8 +438,11 @@ def process_round(session, settings):
             try:
                 advance_transfer(session, settings, session.get(Task, operation.task_id), operation)
             except Exception as error:
-                log_exception(logger, "分类搬运恢复失败，保留冲突供核对 | operation_id=%s", error, operation.id)
                 session.rollback()
+                if isinstance(error, ValueError) and str(error) in DEFERRED_TASK_REASONS:
+                    logger.info("分类搬运恢复暂缓，等待反馈重放 | operation_id=%s | reason=%s", operation.id, error)
+                    continue
+                log_exception(logger, "分类搬运恢复失败，保留冲突供核对 | operation_id=%s", error, operation.id)
                 operation.status = "conflict"
                 session.commit()
         reconcile(session, settings)
@@ -302,13 +461,18 @@ def process_round(session, settings):
             terminal, code = "succeeded", None
         except Exception as error:
             session.rollback()
-            terminal = "cancelled" if isinstance(error, ValueError) and str(error) in ("configuration_changed", "asset_feedback_changed", "feature_signature_changed") else "failed"
-            # Error messages may contain private filenames, SQL parameters or model output.
-            code = str(error) if isinstance(error, ValueError) and str(error).replace("_", "").isalnum() and len(str(error)) <= 64 else type(error).__name__
-            log_exception(logger, "任务执行失败 | task_id=%s | kind=%s | error_code=%s", error, task.id, task.kind, code)
+            terminal, code, expected = task_failure(error, task.attempts)
+            if terminal == "queued" and code in DEFERRED_TASK_REASONS:
+                logger.info("任务暂缓，等待反馈重放后继续 | task_id=%s | reason=%s", task.id, code)
+            elif expected:
+                logger.info("任务输入已过期，已取消，后续按最新数据发现任务 | task_id=%s | kind=%s | reason=%s", task.id, task.kind, code)
+            else:
+                log_exception(logger, "任务执行失败 | task_id=%s | kind=%s | error_code=%s", error, task.id, task.kind, code)
         session.execute(update(Task).where(Task.id == task.id, Task.claim_token == token, Task.status == "running").values(
-            status=terminal, error_code=code, finished_at=utc_now()))
+            **task_result(terminal, code)))
         session.commit()
+        if terminal == "queued" and code not in DEFERRED_TASK_REASONS:
+            logger.warning("数据库事务冲突，任务已回滚并重新入队 | task_id=%s | attempt=%s/3 | reason=%s", task.id, task.attempts, code)
         logger.info("任务结束 | task_id=%s | kind=%s | status=%s | error_code=%s | elapsed=%.1fs",
             task.id, task.kind, terminal, code or "-", time.monotonic() - task_started)
         return task.id

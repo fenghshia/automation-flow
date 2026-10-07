@@ -5,10 +5,11 @@ import logging
 import math
 import os
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 FIELDS = {"stage", "modality", "completed", "total", "elapsed_seconds", "epoch", "epochs",
           "training_loss", "validation_loss", "status"}
@@ -66,9 +67,22 @@ class ProgressHandler(logging.Handler):
             for key, value in fields.items():
                 if _valid_field(key, value):
                     payload[key] = value
-            temporary = self.path.with_suffix(".pending")
-            temporary.write_text(json.dumps(payload, ensure_ascii=True, allow_nan=False), encoding="utf-8")
-            os.replace(temporary, self.path)
+            # Separate handlers/processes must not share a staging filename.
+            temporary = self.path.with_name(self.task_id + "." + uuid4().hex + ".pending")
+            try:
+                temporary.write_text(json.dumps(payload, ensure_ascii=True, allow_nan=False), encoding="utf-8")
+                for attempt in range(5):
+                    try:
+                        os.replace(temporary, self.path)
+                        break
+                    except PermissionError as error:
+                        # Windows readers/antivirus can briefly deny replacement.
+                        # Other I/O errors and persistent denials stay diagnostic.
+                        if getattr(error, "winerror", None) not in (5, 32, 33) or attempt == 4:
+                            raise
+                        time.sleep(.01 * 2 ** attempt)
+            finally:
+                temporary.unlink(missing_ok=True)
         finally:
             self.release()
 

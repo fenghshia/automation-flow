@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from .feature_store import FeatureStore
 from .features.contract import MODALITIES, canonical_json
-from .models import Asset, FeatureBundle, ModelRun, Variant
+from .models import Asset, FeatureBundle, FeedbackEvent, ModelRun, Variant
 from .observability import progress_phase
 from .model_registry import SLOTS, model_type as validate_model_type
 
@@ -48,11 +48,58 @@ def dataset(session, signature, model_type="logistic_regression"):
     return (vectors if model_type == "mil" else np.asarray(vectors)), np.asarray(labels), snapshot
 
 
-def require_current(session, snapshot):
+def lock_assets(session, asset_ids):
+    """Acquire every asset lock in one global order, before any model lock."""
+    ids = set(asset_ids)
+    if not ids:
+        return {}
+    rows = session.scalars(select(Asset).where(Asset.id.in_(ids)).order_by(Asset.id)
+        .with_for_update(of=Asset).execution_options(populate_existing=True)).all()
+    return {asset.id: asset for asset in rows}
+
+
+def _feedback_since(session, snapshot, current):
+    changed = {item["asset_id"]: item for item in snapshot if item["asset_id"] in current
+               and current[item["asset_id"]]["label_revision"] > item["label_revision"]}
+    events = {identifier: [] for identifier in changed}
+    if changed:
+        rows = session.scalars(select(FeedbackEvent).where(FeedbackEvent.asset_id.in_(changed),
+            FeedbackEvent.resulting_revision > min(item["label_revision"] for item in changed.values()))
+            .order_by(FeedbackEvent.resulting_revision))
+        for event in rows:
+            if changed[event.asset_id]["label_revision"] < event.resulting_revision <= current[event.asset_id]["label_revision"]:
+                events[event.asset_id].append(event)
+    return events
+
+
+def training_labels_changed(session, snapshot, data):
+    """Ignore repeated confirmation, but detect corrections including flip-backs."""
+    current = {item["asset_id"]: item for item in data}
+    if any(item["asset_id"] not in current or current[item["asset_id"]]["label"] != item["label"] for item in snapshot):
+        return True
+    events = _feedback_since(session, snapshot, current)
+    return any(event.label != item["label"] for item in snapshot for event in events.get(item["asset_id"], ()))
+
+
+def require_current(session, snapshot, *, lock=True):
+    ids = [item["asset_id"] for item in snapshot]
+    assets = lock_assets(session, ids) if lock else {a.id: a for a in session.scalars(select(Asset)
+        .where(Asset.id.in_(ids)).execution_options(populate_existing=True))}
+    current = {identifier: {"label": asset.label, "label_revision": asset.label_revision} for identifier, asset in assets.items()}
+    events = _feedback_since(session, snapshot, current)
     for item in snapshot:
-        asset = session.get(Asset, item["asset_id"], populate_existing=True, with_for_update=True)
-        if asset is None or (asset.label, asset.label_revision) != (item["label"], item["label_revision"]):
+        asset = assets.get(item["asset_id"])
+        if asset is None or asset.label != item["label"] or asset.label_revision < item["label_revision"]:
             raise ValueError("training_labels_changed")
+        if asset.label_revision != item["label_revision"]:
+            history = events.get(asset.id, [])
+            # Only a complete chain of same-label events can safely advance the
+            # audit revision. Actual corrections, gaps and direct edits fail.
+            if len(history) != asset.label_revision - item["label_revision"] or any(
+                    (event.expected_revision, event.resulting_revision, event.label) !=
+                    (item["label_revision"] + offset, item["label_revision"] + offset + 1, item["label"])
+                    for offset, event in enumerate(history)):
+                raise ValueError("training_labels_changed")
 
 
 def training_snapshot(session, signature):
@@ -70,20 +117,45 @@ def training_snapshot(session, signature):
     return result
 
 
-def train(session, signature, task_id=None, model_type="logistic_regression", settings=None):
+def require_training_snapshot(session, signature, snapshot):
+    """Validate the fitted inputs; additional samples belong to the next run."""
+    require_current(session, snapshot)
+    rows = session.execute(select(Variant.asset_id, FeatureBundle.id, FeatureBundle.manifest_sha256)
+        .join(FeatureBundle, FeatureBundle.variant_id == Variant.id).where(
+            FeatureBundle.id.in_([item["bundle_id"] for item in snapshot]),
+            FeatureBundle.status == "ready", FeatureBundle.feature_signature == signature)).all()
+    expected = {(item["asset_id"], item["bundle_id"], item["manifest_sha256"]) for item in snapshot}
+    if set(rows) != expected:
+        raise ValueError("training_dataset_changed")
+
+
+def select_threshold(actual, probabilities, requirements):
+    from .evaluation import classification_metrics, acceptance_result
+    thresholds = np.linspace(0.1, 0.9, 17)
+    results = [classification_metrics(actual, probabilities >= value) for value in thresholds]
+    qualified = [index for index, metrics in enumerate(results) if acceptance_result(metrics, requirements)["passed"]]
+    best = max(qualified or range(len(thresholds)), key=lambda index: results[index]["balanced_accuracy"])
+    return float(thresholds[best]), results[best], acceptance_result(results[best], requirements)
+
+
+def train(session, signature, task_id=None, model_type="logistic_regression", settings=None, *, acceptance=None):
     from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+    from sklearn.metrics import roc_auc_score
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import StandardScaler
 
     started = time.monotonic()
     validate_model_type(model_type)
     from .training_config import effective, digest
-    hyperparameters = effective(settings, model_type)
-    configuration_digest = digest(settings, model_type)
+    hyperparameters = effective(settings, model_type, acceptance=acceptance)
+    configuration_digest = digest(settings, model_type, acceptance=acceptance)
     logger.info("个人分类器训练开始 | task_id=%s | model_type=%s | feature_signature=%s", task_id or "-", model_type, signature)
     with progress_phase(logger, "读取并校验训练摘要", task_id=task_id):
         x, y, snapshot = dataset(session, signature, model_type)
+    # Numerical inputs and their validation snapshot are plain values. Return
+    # the DB connection before fitting or waiting for an exclusive GPU lease;
+    # require_training_snapshot rechecks them before publishing the model.
+    session.commit()
     logger.info("训练样本已加载 | task_id=%s | positives=%s | negatives=%s | assets=%s | input_dimensions=%s",
         task_id or "-", int((y == 1).sum()), int((y == 0).sum()), len(y),
         x.shape[1] if isinstance(x, np.ndarray) and x.ndim == 2 else "window_bags")
@@ -120,14 +192,15 @@ def train(session, signature, task_id=None, model_type="logistic_regression", se
                       "coef": classifier.coef_[0].tolist(), "intercept": float(classifier.intercept_[0])}
     if probabilities.shape != (len(holdout),) or not np.isfinite(probabilities).all() or ((probabilities < 0) | (probabilities > 1)).any():
         raise ValueError("invalid_validation_probabilities")
-    # Select a threshold on held-out assets; keep these metrics explicitly labelled.
-    thresholds = np.linspace(0.1, 0.9, 17)
-    accuracies = [balanced_accuracy_score(y[holdout], probabilities >= value) for value in thresholds]
-    threshold = float(thresholds[int(np.argmax(accuracies))])
+    # Prefer thresholds that meet both label precision gates. Use balanced
+    # accuracy to retain coverage rather than choosing tiny perfect cohorts.
+    requirements = {name + "_precision": hyperparameters["activation_" + name + "_precision"] for name in ("like", "dislike")}
+    threshold, metrics, accepted = select_threshold(y[holdout], probabilities, requirements)
     validation = {"method": "stratified_asset_holdout", "seed": hyperparameters["seed"],
         "training_assets": len(fit), "validation_assets": len(holdout),
-        "balanced_accuracy": float(max(accuracies)), "roc_auc": float(roc_auc_score(y[holdout], probabilities)),
-        "threshold_selected_on_validation": True, "activation_gate": hyperparameters["activation_balanced_accuracy"], "model_type": model_type,
+        "balanced_accuracy": metrics["balanced_accuracy"], "roc_auc": float(roc_auc_score(y[holdout], probabilities)),
+        "labels": metrics["labels"], "confusion": metrics["confusion"], "accuracy": metrics["accuracy"],
+        "acceptance": accepted, "threshold_selected_on_validation": True, "model_type": model_type,
         "training_asset_ids": [snapshot[i]["asset_id"] for i in fit],
         "validation_asset_ids": [snapshot[i]["asset_id"] for i in holdout], **measurements}
     from importlib.metadata import version
@@ -144,15 +217,13 @@ def train(session, signature, task_id=None, model_type="logistic_regression", se
     session.add(run)
     logger.info("验证完成，核对标签版本并保存模型 | task_id=%s | balanced_accuracy=%.4f | roc_auc=%.4f | threshold=%.3f",
         task_id or "-", validation["balanced_accuracy"], validation["roc_auc"], threshold)
-    require_current(session, snapshot)
-    if training_snapshot(session, signature) != snapshot:
-        raise ValueError("training_dataset_changed")
+    require_training_snapshot(session, signature, snapshot)
     if settings and settings.get("grouped"):
         from env import EnvConfig
         current = next((g for g in EnvConfig.video_filter_settings(ignore_scope=True)["groups"] if g["name"] == settings["name"] and g["enabled"]), None)
-        if current is None or digest(current, model_type) != configuration_digest:
+        if current is None or digest(current, model_type, acceptance=acceptance) != configuration_digest:
             raise ValueError("training_configuration_changed")
-    if validation["balanced_accuracy"] >= hyperparameters["activation_balanced_accuracy"] and validation["roc_auc"] >= hyperparameters["activation_roc_auc"]:
+    if accepted["passed"]:
         for old in session.execute(select(ModelRun).filter_by(active_slot=SLOTS[model_type]).with_for_update()).scalars():
             old.active_slot, old.status = None, "retired"
         session.flush()
@@ -161,11 +232,14 @@ def train(session, signature, task_id=None, model_type="logistic_regression", se
     logger.info("模型已保存到数据库 | task_id=%s | model_type=%s | model_id=%s | status=%s | parameter_bytes=%s | elapsed=%.1fs",
         task_id or "-", model_type, run.id, run.status, len(payload), time.monotonic() - started)
     if run.status != "active":
-        logger.warning("模型未激活：验证指标未达到门槛 | model_id=%s | required_balanced_accuracy=0.6 | required_roc_auc=0.6", run.id)
+        logger.warning("模型未激活：标签精确率未达到门槛 | model_id=%s | like_precision=%s/%s | dislike_precision=%s/%s",
+            run.id, validation["labels"]["like"]["precision"], requirements["like_precision"],
+            validation["labels"]["dislike"]["precision"], requirements["dislike_precision"])
     return run
 
 
-def score(session, model, bundle):
+def require_model(session, model, bundle, *, lock=True):
+    """Validate serving identity and parameters; training labels may evolve."""
     from .scope import current_scope
     scope = current_scope()
     if scope and ((model.dataset_group_id, model.reset_epoch) != (scope["id"], scope["epoch"]) or
@@ -173,13 +247,24 @@ def score(session, model, bundle):
         raise ValueError("cross_group_or_stale_epoch_model")
     if model.status != "active" or model.active_slot != SLOTS[model.model_type] or model.feature_signature != bundle.manifest["feature_signature"]:
         raise ValueError("active_compatible_model_required")
-    require_current(session, model.dataset_snapshot)
     blob = bytes(model.model_blob)
     if hashlib.sha256(blob).hexdigest() != model.sha256:
         raise ValueError("model_checksum_mismatch")
+    return blob
+
+
+def score(session, model, bundle, settings=None, task_id=None, *, validated_blob=None):
+    blob = validated_blob if validated_blob is not None else require_model(session, model, bundle)
     if model.model_type == "mil":
-        from .mil import deserialize, probability, window_bag
-        return probability(deserialize(blob), window_bag(bundle))
+        from .mil import window_bag
+        from .worker_client import run_mil_prediction
+        if settings is None:
+            from .scope import current_scope
+            scope = current_scope()
+            settings = scope["settings"] if scope else None
+        if settings is None:
+            raise ValueError("mil_runtime_settings_required")
+        return run_mil_prediction(blob, window_bag(bundle), settings, task_id)
     parameters = json.loads(blob)
     x = input_vector(bundle)
     mean, scale, coef = [np.asarray(parameters[name], dtype=np.float64) for name in ("mean", "scale", "coef")]

@@ -18,6 +18,12 @@ class ImageCompressionMission(db.Model):
     __tablename__ = "image_compression_mission"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # Nullable snapshots preserve legacy rows without guessing their scope.
+    group_name = db.Column(db.String(64), nullable=True, index=True)
+    source_directory = db.Column(db.Text, nullable=True)
+    output_directory = db.Column(db.Text, nullable=True)
+    output_scope_key = db.Column(db.String(64), nullable=True, index=True)
+    flatten = db.Column(db.Boolean, nullable=False, default=True, server_default=db.true())
     source_path = db.Column(db.Text, nullable=False, unique=True)
     source_kind = db.Column(db.String(16), nullable=False)
     source_name = db.Column(db.Text, nullable=False)

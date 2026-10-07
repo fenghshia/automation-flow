@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import Integer, func, select
 
 from .evaluation import actual_metrics
 from .features.contract import FeatureSignature
@@ -67,6 +67,7 @@ def status_snapshot(session, settings, include_versions=False):
         "summary_coverage": counts["summarized_present_variants"] / counts["present_variants"] if counts["present_variants"] else None,
         "model": {key: model[key] for key in ("id", "validation", "threshold")} if model else None,
         "selected_classifier": selected, "models": models, "actual_accuracy": actual,
+        "automatic_training": False,
         "model_manifest_configured": settings.get("model_manifest") is not None,
         "feedback_journal_pending": len(list((settings["state_directory"] / "feedback").glob("*.json"))) if settings.get("state_directory") else 0,
         "role_accessible": {role: path.is_dir() for role, path in settings["directories"].items()}}
@@ -88,10 +89,49 @@ def dashboard_details(session, settings):
         tasks.append({"id": identifier, "kind": kind, "status": status, "created_at": iso(created), "elapsed": elapsed,
             "attempts": attempts, "error_code": error, "file_name": name, "model_type": inputs.get("model_type"), "progress": progress})
     last_scan = session.execute(select(ScanRun.finished_at, ScanRun.complete).order_by(ScanRun.created_at.desc()).limit(1)).first()
-    return {"tasks": tasks, "current_task": next((task for task in tasks if task["status"] == "running"), None),
+    queue = {kind: {"queued": queued, "running": active} for kind, queued, active in session.execute(
+        select(Task.kind, func.sum((Task.status == "queued").cast(Integer)),
+            func.sum((Task.status == "running").cast(Integer))).where(Task.status.in_(("queued", "running"))).group_by(Task.kind))}
+    oldest = session.scalar(select(func.min(Task.created_at)).where(Task.status == "queued"))
+    return {"tasks": tasks, "queue": queue,
+            "oldest_wait_seconds": max(0, int((now - oldest.replace(tzinfo=timezone.utc)).total_seconds())) if oldest else 0,
+            "current_task": next((task for task in tasks if task["status"] == "running"), None),
             "running_tasks": [task for task in tasks if task["status"] == "running"][:6],
             "last_scan": {"at": iso(last_scan[0]), "complete": last_scan[1]} if last_scan else None,
             "updated_at": now.isoformat()}
+
+
+def training_details(session, settings):
+    """Training metadata only; never deserialize model or feature payloads."""
+    from .model_registry import MODEL_TYPES
+    from .training_config import effective
+    history = [dict(row._mapping) for row in session.execute(select(
+        ModelRun.id, ModelRun.model_type, ModelRun.status, ModelRun.threshold,
+        ModelRun.validation, ModelRun.created_at).order_by(ModelRun.created_at.desc(), ModelRun.id.desc()).limit(20))]
+    for run in history:
+        run["created_at"] = iso(run["created_at"])
+    latest = {}
+    for kind in MODEL_TYPES:
+        row = session.execute(select(ModelRun.id, ModelRun.status, ModelRun.validation)
+            .where(ModelRun.model_type == kind).order_by(ModelRun.created_at.desc(), ModelRun.id.desc()).limit(1)).first()
+        latest[kind] = dict(row._mapping) if row else None
+    now, tasks = datetime.now(timezone.utc), []
+    rows = session.execute(select(Task.id, Task.status, Task.created_at, Task.claimed_at,
+        Task.finished_at, Task.error_code, Task.input_snapshot).where(Task.kind == "train")
+        .order_by((Task.status == "running").desc(), Task.created_at.desc(), Task.id.desc()).limit(20))
+    for identifier, status, created, claimed, finished, error, inputs in rows:
+        progress = read_progress(settings["state_directory"], identifier) if status == "running" else None
+        elapsed = max(0, int(((finished.replace(tzinfo=timezone.utc) if finished else now)
+            - claimed.replace(tzinfo=timezone.utc)).total_seconds())) if claimed else None
+        tasks.append({"id": identifier, "status": status, "model_type": inputs.get("model_type", "logistic_regression"),
+            "created_at": iso(created), "elapsed": elapsed, "error_code": error, "progress": progress,
+            "acceptance": inputs.get("acceptance")})
+    pending = list(session.scalars(select(Task.input_snapshot)
+        .where(Task.kind == "train", Task.status.in_(("queued", "running")))))
+    return {"training_history": history, "latest_training": latest, "training_tasks": tasks,
+        "training_pending": {item.get("model_type", "logistic_regression") for item in pending},
+        "training_settings": {kind: effective(settings, kind) for kind in MODEL_TYPES},
+        "updated_at": now.isoformat()}
 
 
 def groups_snapshot(session, settings):
@@ -99,14 +139,20 @@ def groups_snapshot(session, settings):
     from .scope import group_scope
     from .supervisor import snapshot
     from media_lineage.models import ResourceLease
-    lease_counts = session.execute(select(ResourceLease.mode, ResourceLease.status, func.count()).where(
-        ResourceLease.status.in_(("waiting", "active", "conflict"))).group_by(ResourceLease.mode, ResourceLease.status)).all()
-    resources = {"extract_active": 0, "extract_waiting": 0, "exclusive_active": 0, "exclusive_waiting": 0, "conflicts": 0}
-    for mode, status, count in lease_counts:
+    from media_lineage.resources import admission_decisions
+    leases = session.scalars(select(ResourceLease).where(
+        ResourceLease.status.in_(("waiting", "active", "conflict")))).all()
+    resources = {"extract_active": 0, "extract_waiting": 0, "exclusive_active": 0, "exclusive_waiting": 0,
+                 "compression_active": 0, "compression_waiting": 0, "conflicts": 0}
+    for lease in leases:
+        mode, status = lease.mode, lease.status
         if status == "conflict":
-            resources["conflicts"] += count
+            resources["conflicts"] += 1
         else:
-            resources[("extract_" if mode == "extract_shared" else "exclusive_") + ("active" if status == "active" else "waiting")] += count
+            suffix = "active" if status == "active" else "waiting"
+            resources[("extract_" if mode == "extract_shared" else "exclusive_") + suffix] += 1
+            if mode == "extract_shared" and (lease.memory_observation or {}).get("workload_type") == "compression":
+                resources["compression_" + suffix] += 1
     groups = []
     running = []
     for group in settings.get("groups", []):
@@ -120,4 +166,5 @@ def groups_snapshot(session, settings):
                 running.extend({**task, "group_name": group["name"]} for task in details["running_tasks"])
         groups.append(item)
     return {"enabled": settings.get("enabled", False), "groups": groups, "running_tasks": running[:6],
-            "resources": {**snapshot(), **resources, "configured_concurrency": settings.get("extract_concurrency", 6)}}
+            "resources": {**snapshot(), **resources, "admission": list(admission_decisions().values()),
+                "configured_concurrency": settings.get("extract_concurrency", 6)}}

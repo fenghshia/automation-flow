@@ -28,6 +28,7 @@ class EnvConfig:
         "IMAGE_COMPRESSION_SOURCE_DIR",
         "IMAGE_COMPRESSION_OUTPUT_DIR",
         "IMAGE_COMPRESSION_7ZIP_BIN_DIR",
+        "IMAGE_COMPRESSION_GROUPS_CONFIG",
         "VIDEO_FILTER_CONFIRMED_LIKE_DIR",
         "VIDEO_FILTER_PREDICTED_LIKE_DIR",
         "VIDEO_FILTER_PREDICTED_DISLIKE_DIR",
@@ -198,6 +199,34 @@ class EnvConfig:
     @classmethod
     def image_compression_7zip_bin_directory(cls):
         return cls._required_directory("IMAGE_COMPRESSION_7ZIP_BIN_DIR")
+
+    @classmethod
+    def image_compression_settings(cls):
+        cls._load()
+        from image_compression.group_config import (
+            anchored, directory_key, load_groups, validate_groups,
+        )
+        from logging_config import register_redaction_values
+        try:
+            configured = os.getenv("IMAGE_COMPRESSION_GROUPS_CONFIG")
+            if configured is not None:
+                path = anchored(configured, cls._project_dir)
+                register_redaction_values([path])
+                groups = load_groups(path, cls._project_dir)
+            else:
+                source = anchored(os.getenv("IMAGE_COMPRESSION_SOURCE_DIR"), cls._project_dir)
+                output = anchored(os.getenv("IMAGE_COMPRESSION_OUTPUT_DIR"), cls._project_dir)
+                groups = validate_groups([{
+                    "name": "legacy", "source_directory": source,
+                    "output_directory": output, "flatten": True,
+                    "output_scope_key": directory_key(output),
+                }])
+            register_redaction_values([p for group in groups for p in (
+                group["source_directory"], group["output_directory"],
+            )])
+            return {"groups": groups, "grouped": configured is not None}
+        except (ValueError, OSError, TypeError) as error:
+            raise RuntimeError("Invalid image_compression group configuration.") from error
 
     @classmethod
     def _boolean(cls, name, default=False):
