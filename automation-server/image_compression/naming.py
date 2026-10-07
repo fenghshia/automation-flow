@@ -25,6 +25,21 @@ class NameCandidate:
     basename: str
 
 
+@dataclass(frozen=True)
+class DirectorySegment:
+    key: str
+    name: str
+    archive: bool = False
+
+
+@dataclass(frozen=True)
+class TreeCandidate:
+    key: str
+    provenance: str
+    basename: str
+    directories: tuple[DirectorySegment, ...]
+
+
 def collision_key(name):
     return unicodedata.normalize("NFC", name).casefold()
 
@@ -95,3 +110,35 @@ def allocate_names(candidates):
         result[candidate.key] = chosen
     return result
 
+
+def allocate_tree_paths(candidates):
+    """Allocate every sibling namespace together, including directory/file clashes."""
+    def node():
+        return {"directories": {}, "files": []}
+
+    root = node()
+    for candidate in candidates:
+        current = root
+        for segment in candidate.directories:
+            if segment.key not in current["directories"]:
+                current["directories"][segment.key] = (segment, node())
+            current = current["directories"][segment.key][1]
+        current["files"].append(candidate)
+    result = {}
+
+    def walk(current, parent):
+        siblings = [NameCandidate(
+            "directory:" + key, ("2/" if segment.archive else "0/") + segment.key,
+            segment.name,
+        ) for key, (segment, _) in current["directories"].items()]
+        siblings.extend(NameCandidate(
+            "file:" + leaf.key, "1/" + leaf.provenance, leaf.basename,
+        ) for leaf in current["files"])
+        names = allocate_names(siblings)
+        for key, (_, child) in current["directories"].items():
+            walk(child, parent / names["directory:" + key])
+        for leaf in current["files"]:
+            result[leaf.key] = parent / names["file:" + leaf.key]
+
+    walk(root, Path())
+    return result

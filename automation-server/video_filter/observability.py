@@ -10,6 +10,24 @@ from pathlib import Path
 
 from logging_config import SafeFormatter, register_redaction_values
 
+_status_lock = threading.Lock()
+_statuses = {}
+
+
+def status_log(logger, key, message, *args, interval=60, state=None):
+    """Log a state change immediately, and stable states at most once a minute."""
+    now = time.monotonic()
+    with _status_lock:
+        previous = _statuses.get(key)
+        current = args if state is None else state
+        if previous and previous[0] == current and now - previous[1] < interval:
+            return
+        _statuses[key] = (current, now)
+        if len(_statuses) > 2048:
+            oldest = min(_statuses, key=lambda item: _statuses[item][1])
+            _statuses.pop(oldest, None)
+    logger.info(message, *args)
+
 
 def log_failure(logger, message, error, *args):
     """Keep every traceback frame, while SQLAlchemy suppresses bound payloads."""
@@ -45,9 +63,10 @@ def redact_paths(values):
 class WorkerLogHandler(logging.Handler):
     """Flush JSON lines to the parent; only the parent owns rotating log files."""
 
-    def __init__(self, stream, task_id):
+    def __init__(self, stream, task_id, context=None):
         super().__init__()
         self.stream, self.task_id = stream, task_id
+        self.context = context or {}
         self.setFormatter(SafeFormatter("%(message)s"))
 
     def emit(self, record):
@@ -56,6 +75,9 @@ class WorkerLogHandler(logging.Handler):
         progress = getattr(record, "video_filter_progress", None)
         if isinstance(progress, dict):
             payload["progress"] = progress
+        performance = getattr(record, "video_filter_performance", None)
+        if isinstance(performance, dict):
+            payload["performance"] = {**performance, **self.context}
         self.stream.write(json.dumps(payload, ensure_ascii=True) + "\n")
         self.stream.flush()
 
@@ -69,7 +91,12 @@ def configure_worker_logs(request, stream=None):
     logger = logging.getLogger("video_filter")
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    logger.addHandler(WorkerLogHandler(stream or sys.stdout, request.get("task_id", "-")))
+    for handler in list(logger.handlers):
+        if isinstance(handler, WorkerLogHandler):
+            logger.removeHandler(handler)
+            handler.close()
+    logger.addHandler(WorkerLogHandler(stream or sys.stdout, request.get("task_id", "-"),
+        {key: request[key] for key in ("dataset_group_id", "reset_epoch") if key in request}))
 
 
 @contextmanager

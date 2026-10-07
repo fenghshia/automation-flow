@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import zipfile
+from contextlib import nullcontext
 
 import numpy as np
 
@@ -70,8 +71,11 @@ def network(dropout=.2):
 def tensor_input(x, valid, mean, scale, device):
     import torch
 
-    normalized = np.where(valid, (x - mean) / scale, 0)
-    return torch.from_numpy(np.concatenate((normalized, valid.astype(np.float32)), axis=1).astype(np.float32)).to(device)
+    values = torch.as_tensor(x, dtype=torch.float32, device=device)
+    mask = torch.as_tensor(valid, dtype=torch.bool, device=device)
+    normalized = torch.where(mask, (values - torch.as_tensor(mean, device=device)) /
+                             torch.as_tensor(scale, device=device), 0)
+    return torch.cat((normalized, mask.to(torch.float32)), dim=1)
 
 
 def bag_logit(model, bag, mean, scale, device, chunk_size=512):
@@ -97,7 +101,7 @@ def bag_logit(model, bag, mean, scale, device, chunk_size=512):
 
 
 def fit(bags, y, fit_indices, validation_indices, *, device="cpu", epochs=60, patience=8, max_train_windows=512, task_id=None,
-        seed=1729, learning_rate=.0003, weight_decay=.001, dropout=.2, cpu_threads=1):
+        seed=1729, learning_rate=.0003, weight_decay=.001, dropout=.2, cpu_threads=1, gpu_phase=None):
     import torch
 
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -106,7 +110,30 @@ def fit(bags, y, fit_indices, validation_indices, *, device="cpu", epochs=60, pa
     rng = np.random.default_rng(seed)
     torch.set_num_threads(cpu_threads)
     mean, scale = standardizer([bags[i] for i in fit_indices])
-    model = network(dropout).to(device)
+    model = network(dropout)
+    with gpu_phase("mil_train", 1) if gpu_phase else nullcontext():
+        try:
+            state, probabilities, measurements = _fit_ready(model, bags, y, fit_indices, validation_indices,
+                mean, scale, rng, device, epochs, patience, max_train_windows, task_id,
+                learning_rate, weight_decay, cpu_threads)
+        finally:
+            model.to("cpu")
+            if device.startswith("cuda"):
+                torch.cuda.empty_cache()
+    # Numerical JSON construction runs after releasing exclusive GPU ownership.
+    payload = {"schema": 2, "model_type": "mil", "architecture": ARCHITECTURE,
+               "mean": mean.tolist(), "scale": scale.tolist(),
+               "state": {name: value.tolist() for name, value in state.items()}}
+    return payload, probabilities, measurements
+
+
+def _fit_ready(model, bags, y, fit_indices, validation_indices, mean, scale, rng,
+               device, epochs, patience, max_train_windows, task_id, learning_rate, weight_decay, cpu_threads):
+    import torch
+
+    model.to(device)
+    if device.startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     positive_weight = float((y[fit_indices] == 0).sum() / (y[fit_indices] == 1).sum())
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(positive_weight, device=device))
@@ -150,10 +177,7 @@ def fit(bags, y, fit_indices, validation_indices, *, device="cpu", epochs=60, pa
     model.eval()
     with torch.inference_mode():
         probabilities = [float(torch.sigmoid(bag_logit(model, bags[i], mean, scale, device)).cpu()) for i in validation_indices]
-    payload = {"schema": 2, "model_type": "mil", "architecture": ARCHITECTURE,
-               "mean": mean.tolist(), "scale": scale.tolist(),
-               "state": {name: value.tolist() for name, value in best_state.items()}}
-    return payload, probabilities, {"epochs_completed": epoch, "best_epoch": best_epoch,
+    return best_state, probabilities, {"epochs_completed": epoch, "best_epoch": best_epoch,
         "torch_version": torch.__version__, "positive_class_weight": positive_weight,
         "optimizer": "AdamW", "cpu_threads": cpu_threads,
         "max_train_windows": max_train_windows, "inference_all_windows": True, "device": device,
@@ -208,9 +232,52 @@ def deserialize(blob):
     return parameters
 
 
+def prepare_inference(parameters):
+    import torch
+
+    state, mean, scale = restore(parameters)
+    model = network()
+    model.load_state_dict({name: torch.from_numpy(value.copy()) for name, value in state.items()})
+    return model.eval(), mean, scale
+
+
+def torch_probability(parameters, bag, *, device="cuda:0", chunk_size=512, cpu_threads=1, gpu_phase=None, prepared_model=None):
+    """Run only in an isolated worker; all windows contribute to GPU pooling."""
+    import torch
+
+    if device != "cpu" and (not device.startswith("cuda:") or not device[5:].isdigit()):
+        raise ValueError("invalid_mil_device")
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise ValueError("mil_cuda_unavailable")
+    if type(chunk_size) is not int or chunk_size <= 0:
+        raise ValueError("invalid_mil_chunk_size")
+    model, mean, scale = prepared_model if prepared_model is not None else prepare_inference(parameters)
+    x, valid = bag
+    if (x.ndim != 2 or x.shape[1] != WIDTH or not len(x) or valid.shape != x.shape or
+            valid.dtype != np.bool_ or not np.isfinite(x).all()):
+        raise ValueError("invalid_mil_bag")
+    torch.set_num_threads(cpu_threads)
+    # Match the saved fp32 network rather than introducing TF32 approximation.
+    if device.startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    model.eval()
+    with gpu_phase("mil_predict", 1) if gpu_phase else nullcontext():
+        try:
+            model.to(device)
+            with torch.inference_mode():
+                result = float(torch.sigmoid(bag_logit(model, bag, mean, scale, device, chunk_size)).item())
+        finally:
+            model.to("cpu")
+            if device.startswith("cuda"):
+                torch.cuda.empty_cache()
+    if not np.isfinite(result) or not 0 <= result <= 1:
+        raise ValueError("invalid_model_score")
+    return result
+
+
 def probability(parameters, bag, chunk_size=512):
-    # Equivalent evaluation-mode forward pass, without importing PyTorch into
-    # Flask (Windows MKL/PyTorch DLL conflicts). Training remains a GPU worker.
+    # CPU numerical reference used to validate training/worker outputs. Production
+    # predictions use torch_probability in the isolated inference worker.
     state, mean, scale = restore(parameters)
     x, valid = bag
     maximum, denominator, numerator = None, None, None

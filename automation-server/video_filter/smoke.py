@@ -33,7 +33,8 @@ def main():
             info["duration_seconds"] = min(info["duration_seconds"], args.seconds)
             return info
     for index, path in enumerate(args.files):
-        result = extract(path, PreviewDecoder(EnvConfig.video_filter_ffmpeg_bin_directory()), signature, artifacts)
+        result = extract(path, PreviewDecoder(EnvConfig.video_filter_ffmpeg_bin_directory(), device=group["device"],
+            scope_guard=lambda source: require_scope(group, source, sample=True)), signature, artifacts, device=group["device"])
         print(json.dumps({"sample_index": index, "preview_seconds": result["duration_seconds"],
             "feature_signature": signature.digest, "dimensions": {name: list(value.shape) for name, value in result["vectors"].items()},
             "measurements": result["measurements"]}), flush=True)

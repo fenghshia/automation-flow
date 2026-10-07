@@ -11,7 +11,11 @@ from pathlib import Path
 from .archive import ArchiveBudget, ArchiveExtractor
 from .compressor import ImageInspection, ImageProcessor
 from .manifest import ContentManifest, content_manifest, iter_regular_files
-from .naming import NameCandidate, allocate_names
+from .naming import (
+    DirectorySegment, NameCandidate, TreeCandidate, allocate_names,
+    allocate_tree_paths, output_name,
+)
+from .group_config import reject_links
 from .policy import MAX_IMAGE_BYTES, PASSTHROUGH_FORMATS, is_archive_name
 
 
@@ -74,6 +78,7 @@ class LeafFile:
     key: str
     provenance: str
     path: Path
+    directories: tuple[DirectorySegment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -84,6 +89,7 @@ class PreparedLeaf:
     source_name: str
     planned_basename: str
     inspection: ImageInspection | None
+    directories: tuple[DirectorySegment, ...] = ()
 
 
 class ImageCompressionService:
@@ -97,7 +103,15 @@ class ImageCompressionService:
         pending_root=None,
         archive_extractor=None,
         image_processor=None,
+        flatten=True,
+        progress_callback=None,
     ):
+        if type(flatten) is not bool:
+            raise ValueError("flatten must be boolean")
+        self.flatten = flatten
+        self.progress_callback = progress_callback
+        reject_links(source_directory)
+        reject_links(output_directory)
         self.source_directory = Path(source_directory).resolve()
         self.output_directory = Path(output_directory).resolve()
         self.pending_root = Path(
@@ -110,6 +124,13 @@ class ImageCompressionService:
         if hasattr(self.image_processor, "validate_dependency"):
             self.image_processor.validate_dependency()
         self._validate_roots()
+
+    def report_progress(self, stage, **values):
+        if self.progress_callback is not None:
+            try:
+                self.progress_callback(stage, **values)
+            except Exception:
+                logger.warning("图片进度暂不可用 | event=IMAGE_PROGRESS_UNAVAILABLE")
 
     def _validate_roots(self):
         if not self.source_directory.is_dir():
@@ -130,7 +151,7 @@ class ImageCompressionService:
         self.pending_root.mkdir(parents=True, exist_ok=True)
 
     def mission_directory(self, mission_id):
-        return self.pending_root / str(int(mission_id))
+        return reject_links(self.pending_root / str(int(mission_id)))
 
     def quarantine_path(self, mission_id):
         return self.source_directory / f"{self.QUARANTINE_PREFIX}{int(mission_id)}.pending"
@@ -335,10 +356,22 @@ class ImageCompressionService:
         archive_queue = deque()
         sequence = 0
 
-        def add_leaf(path, provenance):
+        def add_leaf(path, provenance, directories=()):
             nonlocal sequence
             sequence += 1
-            leaves.append(LeafFile(str(sequence), provenance, Path(path)))
+            leaves.append(LeafFile(str(sequence), provenance, Path(path), directories))
+
+        def member_directories(relative, container, prefix):
+            relative = Path(relative)
+            if relative.is_absolute() or relative.drive or ".." in relative.parts:
+                raise ImagePipelineError("Unsafe leaf relative path")
+            segments = list(prefix)
+            for index, part in enumerate(relative.parts[:-1], start=1):
+                key = container + ":dir:" + "/".join(relative.parts[:index])
+                segments.append(DirectorySegment(key, part))
+            return tuple(segments)
+
+        self.report_progress("collecting")
 
         if source_kind == "directory":
             for relative, path in iter_regular_files(staged_source):
@@ -346,12 +379,16 @@ class ImageCompressionService:
                     logger.info("跳过 macOS 元数据文件 | source=%s", relative.as_posix())
                     continue
                 provenance = f"{source_name}/{relative.as_posix()}"
+                directories = member_directories(relative, source_name, ())
                 if is_archive_name(path.name):
-                    archive_queue.append((path, provenance, 1))
+                    prefix = directories + (DirectorySegment(
+                        provenance + ":archive", output_name(path.name, "archive"), True,
+                    ),)
+                    archive_queue.append((path, provenance, 1, prefix))
                 else:
-                    add_leaf(path, provenance)
+                    add_leaf(path, provenance, directories)
         elif source_kind == "archive":
-            archive_queue.append((Path(staged_source), source_name, 1))
+            archive_queue.append((Path(staged_source), source_name, 1, ()))
         else:
             payload = self.mission_directory(mission_id) / "payload" / source_name
             self._copy_path(staged_source, payload)
@@ -364,7 +401,8 @@ class ImageCompressionService:
         budget = ArchiveBudget()
         archive_number = 0
         while archive_queue:
-            archive_path, provenance, depth = archive_queue.popleft()
+            archive_path, provenance, depth, prefix = archive_queue.popleft()
+            self.report_progress("unpacking", current_file=provenance)
             archive_number += 1
             extraction_directory = unpack_root / f"{archive_number:08d}"
             logger.info(
@@ -392,10 +430,14 @@ class ImageCompressionService:
                     logger.info("跳过 macOS 元数据文件 | source=%s", relative.as_posix())
                     continue
                 member_provenance = f"{provenance}!/{relative.as_posix()}"
+                directories = member_directories(relative, provenance, prefix)
                 if is_archive_name(path.name):
-                    archive_queue.append((path, member_provenance, depth + 1))
+                    nested_prefix = directories + (DirectorySegment(
+                        member_provenance + ":archive", output_name(path.name, "archive"), True,
+                    ),)
+                    archive_queue.append((path, member_provenance, depth + 1, nested_prefix))
                 else:
-                    add_leaf(path, member_provenance)
+                    add_leaf(path, member_provenance, directories)
         sorted_leaves = sorted(leaves, key=self._leaf_sort_key)
         logger.info(
             "图片批次文件收集完成 | mission_id=%s | source=%s | "

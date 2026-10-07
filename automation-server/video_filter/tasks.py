@@ -2,11 +2,33 @@
 
 import hashlib
 
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select, update
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from .features.contract import canonical_json
 from .models import Task
+
+
+def transaction_error_code(error):
+    if not isinstance(error, DBAPIError):
+        return None
+    state = getattr(error.orig, "pgcode", None) or getattr(error.orig, "sqlstate", None)
+    return {"40P01": "database_deadlock", "40001": "database_serialization_failure"}.get(state)
+
+
+def _existing_task(session, task):
+    task.enqueue_disposition = "reused"
+    # Compatibility with previously recorded OperationalError failures. Only
+    # recomputation tasks with identical, freshly checked inputs may auto-retry.
+    if task.kind in ("extract", "train", "predict") and task.status == "failed" and task.attempts < 3 and task.error_code in (
+            "database_deadlock", "database_serialization_failure", "OperationalError"):
+        session.execute(update(Task).where(Task.id == task.id, Task.status == "failed", Task.attempts < 3,
+            Task.error_code.in_(("database_deadlock", "database_serialization_failure", "OperationalError"))).values(
+                status="queued", error_code=None, claim_token=None, claimed_at=None, finished_at=None,
+                heartbeat_at=None, execution_owner=None))
+        session.expire(task)
+        task.enqueue_disposition = "retry_queued"
+    return task
 
 
 def claim_task(session, task_id=None):
@@ -46,8 +68,9 @@ def enqueue_task(session, kind, config_revision_id, input_snapshot, asset_id=Non
     query = select(Task).filter_by(dedup_key=dedup_key)
     existing = session.execute(query).scalar_one_or_none()
     if existing is not None:
-        return existing
+        return _existing_task(session, existing)
     task = Task(dedup_key=dedup_key, **values)
+    task.enqueue_disposition = "created"
     try:
         with session.begin_nested():
             session.add(task)
@@ -56,5 +79,5 @@ def enqueue_task(session, kind, config_revision_id, input_snapshot, asset_id=Non
         existing = session.execute(query).scalar_one_or_none()
         if existing is None:
             raise
-        return existing
+        return _existing_task(session, existing)
     return task

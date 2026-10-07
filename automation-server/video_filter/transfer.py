@@ -2,7 +2,9 @@
 
 import os
 import logging
+import math
 import shutil
+import time
 from pathlib import Path
 
 from sqlalchemy import select
@@ -10,8 +12,8 @@ from sqlalchemy import select
 from media_lineage.service import begin_operation, record_published, record_source_removed, verify_operation_source
 from .configuration import record_configuration
 from .feature_store import FeatureStore
-from .identity import hash_stable, path_key, snapshot
-from .learning import score
+from .identity import hash_stable, path_key, snapshot, source_hash
+from .learning import lock_assets, require_model
 from .prediction import predict_both
 from .models import Asset, ConfigRevision, FeatureBundle, Location, ModelRun, Prediction, TransferOperation, Variant
 
@@ -19,43 +21,87 @@ from .models import Asset, ConfigRevision, FeatureBundle, Location, ModelRun, Pr
 logger = logging.getLogger(__name__)
 
 
-def check_gate(session, settings, task):
+def check_gate(session, settings, task, require_prediction=True):
     config = record_configuration(session, settings)
     if not settings.get("transfer_enabled") or config.id != task.config_revision_id or config.active_slot != "active":
         raise ValueError("transfer_disabled_or_configuration_changed")
     if any((settings["state_directory"] / "feedback").glob("*.json")):
         raise ValueError("unresolved_feedback_journal")
     variant = session.get(Variant, task.variant_id)
-    asset = session.get(Asset, variant.asset_id, populate_existing=True, with_for_update=True)
-    if asset.label_revision != task.input_snapshot["label_revision"]:
-        raise ValueError("asset_feedback_changed")
     model = session.get(ModelRun, task.input_snapshot["model_id"], populate_existing=True)
     if model is None or model.model_type != settings.get("classifier", "logistic_regression"):
         raise ValueError("selected_classifier_changed")
+    model_ids = task.input_snapshot.get("model_ids", {model.model_type: model.id})
+    models = [session.get(ModelRun, run_id, populate_existing=True) for run_id in model_ids.values()]
+    asset_ids = {variant.asset_id}
+    for run in models:
+        if run is not None:
+            asset_ids.update(item["asset_id"] for item in run.dataset_snapshot)
+    assets = lock_assets(session, asset_ids)
+    asset = assets.get(variant.asset_id)
+    if asset is None or asset.label_revision != task.input_snapshot["label_revision"]:
+        raise ValueError("asset_feedback_changed")
+    model = session.get(ModelRun, model.id, populate_existing=True)
     bundle = FeatureStore().require_ready(session, task.input_snapshot["bundle_id"])
     if bundle.manifest["variant_id"] != variant.id:
         raise ValueError("summary_variant_mismatch")
-    probability = score(session, model, bundle)
+    require_model(session, model, bundle)
+    # A persisted prediction is part of the transfer evidence. Recovery checks
+    # must validate it, not start a GPU worker from the scheduler control tick.
+    batch = task.input_snapshot.get("prediction_batch_id", task.id)
+    prediction = session.execute(select(Prediction).filter_by(prediction_batch_id=batch, model_id=model.id)).scalar_one_or_none()
+    if prediction is None:
+        if require_prediction:
+            raise ValueError("committed_prediction_required")
+        return variant, asset, model, None
+    if (prediction.variant_id != variant.id or prediction.bundle_id != bundle.bundle_id or
+            prediction.label_revision != asset.label_revision or prediction.threshold != model.threshold or
+            not math.isfinite(prediction.score) or not 0 <= prediction.score <= 1):
+        raise ValueError("prediction_snapshot_mismatch")
+    probability = prediction.score
     return variant, asset, model, probability
 
 
 def classify(session, settings, task):
     operation = session.execute(select(TransferOperation).filter_by(task_id=task.id)).scalar_one_or_none()
     if operation is None:
-        variant, asset, model, probability = check_gate(session, settings, task)
+        variant, asset, model, _ = check_gate(session, settings, task, require_prediction=False)
+        expected_digest = variant.sha256
         source = Path(task.input_snapshot["path"])
         if source.parent.resolve() != settings["directories"]["unclassified"].resolve():
             raise ValueError("source_outside_unclassified")
-        digest, stat = hash_stable(source, task.input_snapshot["source_snapshot"])
-        if digest != variant.sha256:
+        source_stat = dict(task.input_snapshot["source_snapshot"])
+        session.commit()  # No asset/model locks during the full-file read.
+        digest, stat = source_hash(source, source_stat)
+        if digest != expected_digest:
             raise ValueError("source_version_changed")
+        variant, asset, model, _ = check_gate(session, settings, task, require_prediction=False)
+        if task.input_snapshot.get("prediction_ids"):
+            predictions = {}
+            for kind, identifier in task.input_snapshot["prediction_ids"].items():
+                row = session.get(Prediction, identifier)
+                run = session.get(ModelRun, task.input_snapshot["model_ids"].get(kind))
+                if run is None or run.model_type != kind:
+                    raise ValueError("invalid_prediction_model")
+                require_model(session, run, FeatureStore().require_ready(session, task.input_snapshot["bundle_id"]))
+                if row is None or row.prediction_batch_id != task.input_snapshot["prediction_batch_id"] or row.model_id != run.id or row.variant_id != variant.id or row.bundle_id != task.input_snapshot["bundle_id"] or row.label_revision != asset.label_revision or row.threshold != run.threshold or not math.isfinite(row.score) or not 0 <= row.score <= 1 or row.predicted_label != int(row.score >= run.threshold):
+                    raise ValueError("prediction_snapshot_mismatch")
+                predictions[kind] = row
+            if set(predictions) != set(task.input_snapshot["model_ids"]):
+                raise ValueError("prediction_snapshot_mismatch")
+            session.commit()
+            logger.info("分类复用双模型预测 | task_id=%s | prediction_batch_id=%s", task.id, task.input_snapshot["prediction_batch_id"])
+        else:
+            predictions = predict_both(session, task, settings.get("classifier", "logistic_regression"), settings=settings)
+        if settings.get("release_gpu"):
+            settings["release_gpu"]()
+        prediction = predictions[model.model_type]
+        probability = prediction.score
         label = int(probability >= model.threshold)
         role = "predicted_like" if label else "predicted_dislike"
         target = (settings["directories"][role] / source.name).resolve()
         if target.exists():
             raise ValueError("destination_name_conflict")
-        predictions = predict_both(session, task, settings.get("classifier", "logistic_regression"))
-        prediction = predictions[model.model_type]
         lineage_id = begin_operation(session, producer="video_filter", source_path=source, destination_path=target,
             generation=task.id, source_role="unclassified", destination_role=role,
             scope_evidence={key: settings[key] for key in ("dataset_group_id", "reset_epoch") if key in settings})
@@ -87,6 +133,8 @@ def advance_transfer(session, settings, task, operation):
     if target.parent.resolve() != settings["directories"][operation.evidence["destination_role"]].resolve():
         raise ValueError("destination_configuration_changed")
     if operation.status == "planned":
+        source_digest = operation.source_sha256
+        session.commit()
         logger.info("分类搬运开始复制及校验 | task_id=%s | operation_id=%s", task.id, operation.id)
         verify_operation_source(session, lineage_id)
         if target.exists():
@@ -96,22 +144,31 @@ def advance_transfer(session, settings, task, operation):
             operation.status = "conflict"
             session.commit()
             raise ValueError("unverified_staging_conflict")
+        session.commit()  # Copy owns no row locks or DB transaction.
+        copy_started = time.monotonic()
         with source.open("rb") as origin, witness.open("xb") as output:
             shutil.copyfileobj(origin, output, length=1024 * 1024)
             output.flush()
             os.fsync(output.fileno())
         digest, stat = hash_stable(witness)
+        logger.info("分类复制及暂存哈希结束 | task_id=%s | elapsed_seconds=%.3f", task.id, time.monotonic() - copy_started)
         verify_operation_source(session, lineage_id)
-        if digest != operation.source_sha256:
+        if digest != source_digest:
             raise ValueError("staging_checksum_mismatch")
+        # Persist the verified witness before rechecking transient feedback.
+        # Publication below still requires the current gate; a pending journal
+        # must not leave an owned, verified stage looking like an unknown file.
         operation.evidence = {**operation.evidence, "witness_snapshot": stat}
         operation.status = "destination_verified"
         session.commit()
         logger.info("分类暂存已核验并提交 | task_id=%s | operation_id=%s | stage=%s", task.id, operation.id, operation.status)
     if operation.status == "destination_verified":
-        digest, _ = hash_stable(witness, operation.evidence["witness_snapshot"])
-        if digest != operation.source_sha256:
+        source_digest, witness_stat = operation.source_sha256, operation.evidence["witness_snapshot"]
+        session.commit()
+        digest, _ = hash_stable(witness, witness_stat)
+        if digest != source_digest:
             raise ValueError("staging_changed")
+        check_gate(session, settings, task)
         if target.exists():
             if not witness.samefile(target):
                 raise ValueError("destination_ownership_conflict")
@@ -135,9 +192,14 @@ def advance_transfer(session, settings, task, operation):
             operation.status = "conflict"
             session.commit()
             raise ValueError("published_destination_changed")
-        if hash_stable(target, operation.evidence["witness_snapshot"])[0] != operation.source_sha256:
+        source_digest, witness_stat = operation.source_sha256, operation.evidence["witness_snapshot"]
+        session.commit()
+        if hash_stable(target, witness_stat)[0] != source_digest:
             raise ValueError("published_checksum_mismatch")
         verify_operation_source(session, lineage_id, allow_missing=True)
+        check_gate(session, settings, task)
+        if not witness.is_file() or not target.is_file() or not witness.samefile(target) or snapshot(target) != witness_stat:
+            raise ValueError("published_destination_changed")
         # Mapping and destination Location have committed before this source cleanup.
         source.unlink(missing_ok=True)
         record_source_removed(session, lineage_id)

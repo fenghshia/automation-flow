@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from .observability import log_failure as log_exception, redact_paths
 
 from media_lineage.models import LineageEvent
@@ -49,6 +50,17 @@ def scan_directories(settings):
             log_exception(logger, "受管目录扫描失败 | role=%s | deletion_feedback_paused=true", error, role)
             results[role] = {"accessible": False}
     return files, results, all(value["accessible"] for value in results.values())
+
+
+def lineage_pending(session, settings, after_id):
+    """Public events block only the group and epoch that can consume them."""
+    query = select(LineageEvent.id).where(LineageEvent.id > max(after_id, settings.get("lineage_floor", 0)))
+    if settings.get("grouped"):
+        query = query.where(
+            LineageEvent.evidence["dataset_group_id"].as_string() == settings["dataset_group_id"],
+            LineageEvent.evidence["reset_epoch"].as_string() == settings["reset_epoch"],
+        )
+    return session.execute(query.limit(1)).first() is not None
 
 
 def consume_lineage(session, after_id=0, limit=1000):
@@ -167,6 +179,29 @@ def _operations_pending(session, asset_id, settings=None, now=None):
     return any(sequence < 3 for sequence in phases.values())
 
 
+def _insert_scan_location(session, **values):
+    """A concurrent publication may reserve this path after our last lookup."""
+    location = Location(**values)
+    try:
+        with session.begin_nested():
+            session.add(location)
+            session.flush()
+        return location, True
+    except IntegrityError as error:
+        constraint = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
+        if constraint != "vf_group_location_current_path_key" and not (
+            session.get_bind().dialect.name == "sqlite" and
+            "UNIQUE constraint failed: video_filter_location.dataset_group_id, video_filter_location.current_path_key" in str(error.orig)
+        ):
+            raise
+        location = session.scalar(select(Location).where(
+            Location.current_path_key == values["current_path_key"]
+        ).with_for_update().execution_options(populate_existing=True))
+        if location is None:
+            raise
+        return location, False
+
+
 def reconcile(session, settings, now=None):
     if not settings.get("enabled"):
         raise ValueError("video_filter is disabled.")
@@ -203,19 +238,34 @@ def reconcile(session, settings, now=None):
     unstable_files = 0
     floor = settings.get("lineage_floor", 0)
     consume_lineage(session, floor if baseline else (session.scalar(select(ScanRun.lineage_watermark).where(ScanRun.complete == True).order_by(ScanRun.created_at.desc()).limit(1)) or floor))
+    if settings.get("grouped"):
+        from .group_config import require_current_group
+        require_current_group(settings)
+        # Complete enumeration establishes scope only. Partial identity commits
+        # never advance the complete watermark or provide deletion evidence.
+        scan.role_results = {**scan.role_results, "_baseline_ready": True}
+        session.commit()
+    observations = {item.path_key: item for item in session.scalars(select(Observation).where(Observation.config_revision_id == config.id))}
+    currents = {item.current_path_key: item for item in session.scalars(select(Location).where(Location.current_path_key.is_not(None)))}
+    unfinished = session.scalars(select(ScanRun).where(ScanRun.config_revision_id == config.id,
+        ScanRun.complete == False, ScanRun.id != scan.id,
+        ScanRun.role_results["_arrivals_consumed"].as_boolean().is_not(True))).all() if settings.get("grouped") else []
+    arrival_ids = {identifier for pending in unfinished if not pending.role_results.get("_arrivals_consumed")
+        for identifier in pending.role_results.get("_arrival_location_ids", [])}
+    last_scope_check = time.monotonic()
+    hash_seconds, partial_commits = 0, 0
     for role, path, stat in files:
-        if settings.get("grouped"):
-            from .group_config import require_current_group
+        if settings.get("grouped") and time.monotonic() - last_scope_check >= 1:
             require_current_group(settings)
+            last_scope_check = time.monotonic()
         key = path_key(path)
         observed_keys.add(key)
-        observation = session.execute(select(Observation).filter_by(
-            config_revision_id=config.id, path_key=key,
-        )).scalar_one_or_none()
+        observation = observations.get(key)
         if observation is None:
             observation = Observation(config_revision_id=config.id, path_key=key, stable_since=now,
                                       last_seen_at=now, baseline_entry=baseline or settings.get("notifications_uncertain", False), **stat)
             session.add(observation)
+            observations[key] = observation
         elif (observation.size_bytes, observation.modified_ns, observation.file_identity) != (
             stat["size_bytes"], stat["modified_ns"], stat["file_identity"],
         ):
@@ -225,15 +275,39 @@ def reconcile(session, settings, now=None):
         if now - observation.stable_since < timedelta(seconds=settings["stable_seconds"]):
             unstable_files += 1
             continue
-        current = session.execute(select(Location).filter_by(current_path_key=key)).scalar_one_or_none()
+        current = currents.get(key)
         try:
             if current and current.status == "present" and (current.size_bytes, current.modified_ns, current.file_identity) == (
                 stat["size_bytes"], stat["modified_ns"], stat["file_identity"]):
                 digest = session.get(Variant, current.variant_id).sha256
             else:
+                if settings.get("grouped"):
+                    # Commit verified predecessors before the next long read;
+                    # refresh this input afterwards instead of trusting stale ORM state.
+                    session.commit()
+                    partial_commits += 1
+                hash_started = time.monotonic()
                 digest, _ = hash_stable(path, stat)
+                hash_seconds += time.monotonic() - hash_started
+                if settings.get("grouped"):
+                    require_current_group(settings)
+                    if snapshot(path) != stat:
+                        raise ValueError("source_version_changed")
+            if settings.get("grouped"):
+                # A transfer/lineage consumer may have inserted, retired or
+                # replaced this path while hashing released our transaction.
+                current = session.scalar(select(Location).where(
+                    Location.current_path_key == key
+                ).with_for_update().execution_options(populate_existing=True))
+                if current is None:
+                    currents.pop(key, None)
+                else:
+                    currents[key] = current
         except (OSError, ValueError) as error:
-            log_exception(logger, "扫描时文件发生变化，暂缓本轮对账 | scan_id=%s | role=%s", error, scan.id, role)
+            if isinstance(error, FileNotFoundError):
+                logger.info("扫描时视频已移走或删除，暂缓本轮对账 | scan_id=%s | role=%s", scan.id, role)
+            else:
+                log_exception(logger, "扫描时文件发生变化，暂缓本轮对账 | scan_id=%s | role=%s", error, scan.id, role)
             complete = False
             continue
         variant = session.execute(select(Variant).filter_by(sha256=digest)).scalar_one_or_none()
@@ -251,40 +325,71 @@ def reconcile(session, settings, now=None):
             session.flush()
             current = None
         if current is None:
-            current = Location(variant_id=variant.id, role=role, path=str(path), current_path_key=key,
-                               size_bytes=stat["size_bytes"], modified_ns=stat["modified_ns"])
-            session.add(current)
-            new_locations.append(current)
+            current, inserted = _insert_scan_location(session, variant_id=variant.id, role=role,
+                path=str(path), current_path_key=key, size_bytes=stat["size_bytes"], modified_ns=stat["modified_ns"])
+            if not inserted:
+                if current.variant_id != variant.id:
+                    # Preserve the competing publication and pause deletion
+                    # inference. The next scan will verify its file identity.
+                    complete = False
+                    continue
+                entered = current.status == "missing" or current.role != role
+            else:
+                new_locations.append(current)
+            currents[key] = current
         current.role, current.file_identity = role, stat["file_identity"]
         current.size_bytes, current.modified_ns = stat["size_bytes"], stat["modified_ns"]
         current.status, current.missing_since, current.last_scan_id = "present", None, scan.id
         session.flush()
+        if settings.get("grouped") and current in new_locations:
+            scan.role_results = {**scan.role_results,
+                "_arrival_location_ids": [*scan.role_results.get("_arrival_location_ids", []), current.id]}
+            arrival_ids.add(current.id)
         seen_locations.add(current.id)
         if role in ("confirmed_like", "liked", "liked_source") and entered and (not settings.get("grouped") or
                 (not baseline and not observation.baseline_entry) or session.get(Asset, variant.asset_id).label is None):
             positive_ids.add(variant.asset_id)
+            if settings.get("grouped"):
+                # Arrival and its label share one DB transaction. A restart can
+                # never preserve the location while losing its positive intent.
+                # No journal is published for an asset that has not committed.
+                from .feedback import apply_feedback
+                apply_feedback(session, **feedback_values(session.get(Asset, variant.asset_id), 1,
+                    {"reason": "entered_confirmed_like", "scan_id": scan.id}))
+                require_current_group(settings)
+                session.commit()
+                partial_commits += 1
+                logger.info("喜欢到达反馈及文件位置已原子提交 | asset_id=%s | scan_id=%s", variant.asset_id, scan.id)
+        if settings.get("grouped") and len(seen_locations) % 20 == 0:
+            require_current_group(settings)
+            session.commit()
+            partial_commits += 1
     if not complete:
         # A mid-scan source change must not activate a partial baseline.
         session.rollback()
-        config = record_configuration(session, settings)
-        scan = ScanRun(config_revision_id=config.id, role_results=role_results, complete=False, finished_at=now)
-        session.add(scan)
+        if not settings.get("grouped"):
+            config = record_configuration(session, settings)
+            scan = ScanRun(config_revision_id=config.id, role_results=role_results, complete=False, finished_at=now)
+            session.add(scan)
+        else:
+            scan.finished_at = now
         session.commit()
-        logger.warning("扫描途中变化，已回滚部分对账 | scan_id=%s | deletion_feedback_paused=true", scan.id)
+        logger.warning("扫描途中变化，未提交部分已回滚 | scan_id=%s | partial_commits=%s | deletion_feedback_paused=true", scan.id, partial_commits)
         return scan
     previous_scan = session.execute(select(ScanRun).where(ScanRun.complete == True).order_by(ScanRun.created_at.desc()).limit(1)).scalar_one_or_none()
     watermark = previous_scan.lineage_watermark if previous_scan else floor
     scan.lineage_watermark = consume_lineage(session, watermark)
     if settings.get("grouped"):
-        from .group_config import require_current_group
         require_current_group(settings)
-    backlog = session.execute(select(LineageEvent.id).where(LineageEvent.id > scan.lineage_watermark).limit(1)).first()
+    backlog = lineage_pending(session, settings, scan.lineage_watermark)
     feedback = []
-    for asset_id in positive_ids:
+    for asset_id in positive_ids if not settings.get("grouped") else ():
         asset = session.get(Asset, asset_id)
         feedback.append(feedback_values(asset, 1, {"reason": "entered_confirmed_like", "scan_id": scan.id}))
     if complete:
         missing_assets = set()
+        move_variants = set(session.scalars(select(Location.variant_id).where(Location.id.in_(arrival_ids),
+            Location.status == "present", Location.current_path_key.in_(observed_keys)))) if arrival_ids else set()
         for location in session.execute(select(Location).where(Location.current_path_key.is_not(None))).scalars():
             if location.id in seen_locations or location.current_path_key in observed_keys:
                 continue
@@ -297,7 +402,7 @@ def reconcile(session, settings, now=None):
                 location.status, location.current_path_key = "retired", None
                 location.missing_since = None
                 continue
-            if settings.get("grouped") and any(new.variant_id == location.variant_id for new in new_locations):
+            if settings.get("grouped") and location.variant_id in move_variants:
                 # New hash-verified arrival plus disappearance proves a move;
                 # a pre-existing duplicate does not suppress deletion.
                 location.status, location.current_path_key, location.missing_since = "retired", None, None
@@ -324,6 +429,8 @@ def reconcile(session, settings, now=None):
                     for location in mature:
                         location.status, location.current_path_key = "retired", None
     scan.complete, scan.finished_at = complete, now
+    for pending in unfinished:
+        pending.role_results = {**pending.role_results, "_arrivals_consumed": True}
     journal = FeedbackJournal(settings["state_directory"])
     for values in feedback:
         journal.write(values)
@@ -332,5 +439,6 @@ def reconcile(session, settings, now=None):
     for values in feedback:
         journal.submit(session, values)
     logger.info("扫描对账完成 | scan_id=%s | stable_locations=%s | waiting_stable=%s | positive_feedback=%s | negative_feedback=%s | lineage_watermark=%s | lineage_backlog=%s | elapsed=%.1fs",
-        scan.id, len(seen_locations), unstable_files, sum(item["label"] == 1 for item in feedback), sum(item["label"] == 0 for item in feedback), scan.lineage_watermark, bool(backlog), time.monotonic() - started)
+        scan.id, len(seen_locations), unstable_files, len(positive_ids), sum(item["label"] == 0 for item in feedback), scan.lineage_watermark, bool(backlog), time.monotonic() - started)
+    logger.info("扫描阶段耗时 | scan_id=%s | hash_seconds=%.3f | files=%s | partial_identity_commits=%s", scan.id, hash_seconds, len(files), partial_commits)
     return scan
