@@ -91,13 +91,20 @@ def _log_progress(source, media_seconds, duration, state):
 
 
 def transcode(ffmpeg_path, source, destination, plan, timeout, duration=None):
+    from media_lineage.integration import compression_gpu
+    with compression_gpu():
+        return _transcode(ffmpeg_path, source, destination, plan, timeout, duration)
+
+
+def _transcode(ffmpeg_path, source, destination, plan, timeout, duration=None):
     command = build_ffmpeg_command(ffmpeg_path, source, destination, plan)
     started_at = time.monotonic()
     messages = queue.Queue()
     process = None
     tree = None
     from media_lineage.resources import current_lease
-    managed = bool(current_lease())
+    lease = current_lease()
+    managed = bool(lease)
     with tempfile.TemporaryFile(
         mode="w+t", encoding="utf-8", errors="replace"
     ) as stderr_stream:
@@ -114,6 +121,11 @@ def transcode(ffmpeg_path, source, destination, plan, timeout, duration=None):
             if managed:
                 from media_lineage.process_tree import ProcessTree
                 tree = ProcessTree(process)
+                from app import db
+                from media_lineage.resources import heartbeat
+                if not heartbeat(db.session, lease, processes=tree.identities()):
+                    raise RuntimeError("compression_resource_lease_lost")
+                last_heartbeat = time.monotonic()
             reader = threading.Thread(
                 target=_read_progress,
                 args=(process.stdout, messages),
@@ -126,6 +138,10 @@ def transcode(ffmpeg_path, source, destination, plan, timeout, duration=None):
             media_seconds = None
 
             while True:
+                if managed and time.monotonic() - last_heartbeat >= 10:
+                    if not heartbeat(db.session, lease, processes=tree.identities()):
+                        raise RuntimeError("compression_resource_lease_lost")
+                    last_heartbeat = time.monotonic()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(command, timeout)
@@ -148,7 +164,7 @@ def transcode(ffmpeg_path, source, destination, plan, timeout, duration=None):
                     )
 
             return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except Exception as error:
             if process is not None and process.poll() is None:
                 tree.terminate() if tree else process.kill()
                 process.wait()

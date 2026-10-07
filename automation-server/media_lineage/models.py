@@ -33,6 +33,8 @@ class ResourceLease(db.Model):
     status = db.Column(db.String(16), nullable=False, default="waiting")
     created_at = db.Column(db.DateTime, nullable=False, default=utc_now)
     heartbeat_at = db.Column(db.DateTime, nullable=False, default=utc_now)
+    memory_budget_mib = db.Column(db.Integer, nullable=True)
+    memory_observation = db.Column(db.JSON, nullable=False, default=dict, server_default="{}")
     __table_args__ = (
         db.CheckConstraint("mode IN ('extract_shared', 'exclusive_train', 'exclusive_compression')", name="ml_resource_mode"),
         db.CheckConstraint("status IN ('waiting', 'active', 'released', 'conflict')", name="ml_resource_status"),

@@ -1,7 +1,6 @@
 """Opt-in compression integration through the public durable operation contract."""
 
 from contextlib import contextmanager
-from functools import wraps
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from sqlalchemy import select
@@ -82,42 +81,56 @@ def compression_cleaned(session, mission):
         session.commit()
 
 
-def serialized_gpu(function):
-    @wraps(function)
-    def wrapped(*args, **kwargs):
-        from env import EnvConfig
-        from .resources import gpu_lock
+@contextmanager
+def compression_gpu():
+    """Reserve one shared encoder slot only for the lifetime of GPU execution."""
+    import os
+    import time
+    import logging
+    from env import EnvConfig
+    from .resources import gpu_lock
 
-        if not EnvConfig.video_filter_enabled():
-            return function(*args, **kwargs)
-        settings = EnvConfig.video_filter_settings()
-        if settings.get("grouped"):
-            from app import db
-            from .resources import gpu_identity, request_lease, release, lease_scope
-            import os
-            from .resources import process_identity
-            from .workflows import current_binding
-            binding = current_binding()
-            scheduled = function.__name__ == "process_one_mission"
-            request_id = "scheduled:" + (binding["id"] if binding else "standalone") if scheduled else "direct:" + str(uuid4())
-            owner = "compression:" + str(os.getpid()) + ":" + process_identity(os.getpid()) + ":" + request_id
-            # FFmpeg's NVENC uses physical adapter 0, independent of CUDA visibility.
-            device = gpu_identity("driver:0")
-            lease = request_lease(db.session, device, "exclusive_compression", owner)
-            if not lease:
-                if not scheduled:
-                    release(db.session, owner=owner)
-                return None
-            try:
-                with lease_scope(lease):
-                    return function(*args, **kwargs)
-            finally:
-                release(db.session, lease)
+    if not EnvConfig.video_filter_enabled():
+        yield None
+        return
+    settings = EnvConfig.video_filter_settings(ignore_scope=True)
+    if not settings.get("grouped"):
         with gpu_lock(settings["state_directory"]) as acquired:
             if not acquired:
-                return None
-            return function(*args, **kwargs)
-    return wrapped
+                raise RuntimeError("compression_gpu_busy")
+            yield None
+        return
+
+    from app import db
+    from .resources import gpu_identity, request_lease, release, lease_scope, process_identity
+    budget = EnvConfig.video_compression_gpu_settings()
+    owner = "compression:" + str(os.getpid()) + ":" + process_identity(os.getpid()) + ":" + str(uuid4())
+    # NVENC uses physical adapter 0, independent of CUDA visibility.
+    device = gpu_identity("driver:0")
+    deadline = time.monotonic() + budget["wait_seconds"]
+    logger = logging.getLogger("video_compression.resources")
+    lease = None
+    try:
+        logger.info("视频转码等待 GPU 共享准入 | budget_mib=%s | reserve_mib=%s | timeout_seconds=%s",
+            budget["peak_mib"], settings.get("gpu_safety_mib", 1024), budget["wait_seconds"])
+        while True:
+            lease = request_lease(db.session, device, "extract_shared", owner,
+                memory_budget_mib=budget["peak_mib"], reserve_mib=settings.get("gpu_safety_mib", 1024),
+                workload_type="compression", profile_key="nvenc-hevc-p6-v1")
+            if lease:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("compression_gpu_admission_timeout")
+            time.sleep(min(2.0, remaining))
+        logger.info("视频转码获得 GPU 共享资源 | lease_id=%s", lease)
+        with lease_scope(lease):
+            yield lease
+    finally:
+        # Both failed admission and failed encoding must relinquish the request.
+        db.session.rollback()
+        release(db.session, owner=owner)
+        logger.info("视频转码 GPU 资源已释放 | lease_id=%s", lease)
 
 
 @contextmanager

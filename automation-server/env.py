@@ -174,6 +174,20 @@ class EnvConfig:
         return cls._required_directory("VIDEO_COMPRESSION_FFMPEG_BIN_DIR")
 
     @classmethod
+    def video_compression_gpu_settings(cls):
+        cls._load()
+        try:
+            settings = {key: int(os.getenv(variable, default)) for key, variable, default in (
+                ("peak_mib", "VIDEO_COMPRESSION_GPU_PEAK_MIB", 1024),
+                ("wait_seconds", "VIDEO_COMPRESSION_GPU_WAIT_SECONDS", 1800),
+            )}
+            if min(settings.values()) <= 0:
+                raise ValueError("non_positive_compression_gpu_parameter")
+            return settings
+        except ValueError as error:
+            raise RuntimeError("Invalid video_compression GPU configuration.") from error
+
+    @classmethod
     def image_compression_source_directory(cls):
         return cls._required_directory("IMAGE_COMPRESSION_SOURCE_DIR")
 
@@ -309,12 +323,16 @@ class EnvConfig:
                 "model_manifest": anchored(os.environ["VIDEO_FILTER_MODEL_MANIFEST"], cls._project_dir) if os.getenv("VIDEO_FILTER_MODEL_MANIFEST") else None,
                 "device": os.getenv("VIDEO_FILTER_DEVICE", "cuda:0"),
                 "ffmpeg_directory": cls.video_filter_ffmpeg_bin_directory(required=False)}
+            shared["persistent_workers"] = cls._boolean("VIDEO_FILTER_PERSISTENT_WORKERS", default=True)
             if shared["device"] != "cpu" and not (shared["device"].startswith("cuda:") and shared["device"][5:].isdigit()):
                 raise ValueError("invalid_device")
             for suffix, default in (("SCAN_INTERVAL_SECONDS", 60), ("STABLE_SECONDS", 60), ("MISSING_SECONDS", 300),
-                ("TASK_TIMEOUT_SECONDS", 1800), ("BATCH_SIZE", 1), ("EXTRACT_CONCURRENCY", 6), ("WORKER_CPU_THREADS", 1)):
+                ("TASK_TIMEOUT_SECONDS", 1800), ("BATCH_SIZE", 1), ("EXTRACT_CONCURRENCY", 6), ("WORKER_CPU_THREADS", 1),
+                ("GPU_EXTRACT_PEAK_MIB", 1024), ("GPU_PREDICT_PEAK_MIB", 256), ("GPU_SAFETY_MIB", 1024),
+                ("AUDIO_CACHE_MIB", 32), ("DINO_BATCH_SIZE", 16), ("VIDEOMAE_BATCH_SIZE", 4), ("BEATS_BATCH_SIZE", 8),
+                ("WORKER_MODEL_CACHE_MIB", 768), ("WORKER_IDLE_SECONDS", 120), ("WORKER_MAX_TASKS", 100)):
                 value = int(os.getenv("VIDEO_FILTER_" + suffix, default))
-                if value <= 0 or (suffix == "EXTRACT_CONCURRENCY" and value > 64):
+                if value <= 0 or ((suffix == "EXTRACT_CONCURRENCY" or suffix.endswith("BATCH_SIZE")) and value > 64):
                     raise ValueError("invalid_positive_runtime_parameter")
                 shared[suffix.lower()] = value
             path = anchored(os.environ["VIDEO_FILTER_GROUPS_CONFIG"], cls._project_dir)

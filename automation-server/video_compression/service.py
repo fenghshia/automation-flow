@@ -277,9 +277,8 @@ class CompressionService:
             staging.unlink(missing_ok=True)
 
     def process(self, source, published_callback=None):
-        from media_lineage.integration import direct_compression, direct_published, direct_cleaned, serialized_gpu
+        from media_lineage.integration import direct_compression, direct_published, direct_cleaned
 
-        @serialized_gpu
         def run():
             origin = Path(source).resolve()
             destination = (self.output_dir / origin.name).resolve()

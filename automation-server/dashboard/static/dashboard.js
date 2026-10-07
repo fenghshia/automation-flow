@@ -15,6 +15,8 @@
   const now = document.getElementById("refresh-now");
   const toggle = document.getElementById("toggle-refresh");
   let paused = false, busy = false, timer, controller, failures = 0;
+  const editing = () => container.contains(document.activeElement) &&
+    document.activeElement.matches("input, select, textarea");
   function showTimestamp() {
     const value = container.querySelector("[data-updated-at]")?.dataset.updatedAt;
     const date = new Date(value);
@@ -27,6 +29,11 @@
   }
   async function refresh(force = false) {
     if (busy || document.hidden || (paused && !force)) return;
+    if (editing()) {
+      status.textContent = "编辑设置中，稍后刷新";
+      schedule();
+      return;
+    }
     clearTimeout(timer);
     busy = true;
     now.disabled = true;
@@ -39,6 +46,7 @@
       const html = await response.text();
       const parsed = new DOMParser().parseFromString(html, "text/html");
       if (!parsed.querySelector(".snapshot-body")) throw new Error("Invalid snapshot");
+      if (editing()) return;
       container.replaceChildren(...document.importNode(parsed.body, true).childNodes);
       failures = 0;
       error.textContent = "";

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
+import math
+import os
 import re
 import sys
 import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import TracebackType
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Iterable, TextIO
 
 if TYPE_CHECKING:
@@ -114,6 +118,55 @@ class SafeFormatter(logging.Formatter):
             if scope:
                 text += " | group=" + scope["settings"]["name"] + " | dataset_group_id=" + scope["id"] + " | epoch=" + scope["epoch"]
         return _redact(text)
+
+
+def log_performance(event: str, **fields: object) -> None:
+    """Metadata-only measurements; callers must never include media or paths."""
+    def valid(value):
+        if value is None or type(value) is bool:
+            return True
+        if type(value) in (int, float):
+            return math.isfinite(value)
+        if isinstance(value, str):
+            return len(value) <= 128 and not any(token in value for token in ("/", "\\", "://"))
+        if isinstance(value, dict):
+            return len(value) <= 64 and all(isinstance(k, str) and valid(k) and valid(v) for k, v in value.items())
+        if isinstance(value, (list, tuple)):
+            return len(value) <= 128 and all(valid(v) for v in value)
+        return False
+    fields.setdefault("source_pid", os.getpid())
+    if not valid(event) or not valid(fields):
+        return
+    logging.getLogger("video_filter.performance").info(event,
+        extra={"video_filter_performance": {**fields, "event": event}})
+
+
+class PerformanceFilter(logging.Filter):
+    def __init__(self, include):
+        super().__init__()
+        self.include = include
+
+    def filter(self, record):
+        return isinstance(getattr(record, "video_filter_performance", None), dict) == self.include
+
+
+class PerformanceFormatter(logging.Formatter):
+    def format(self, record):
+        payload = {**record.video_filter_performance,
+            "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat(), "pid": record.process}
+        scope_module = sys.modules.get("video_filter.scope")
+        scope = scope_module.current_scope() if scope_module else None
+        if scope:
+            payload.update(dataset_group_id=scope["id"], reset_epoch=scope["epoch"])
+        def redact(value):
+            if isinstance(value, str):
+                return _redact(value)
+            if isinstance(value, dict):
+                return {key: redact(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [redact(item) for item in value]
+            return value
+        return json.dumps(redact(payload), ensure_ascii=False, allow_nan=False)
 
 
 class ContextFilter(logging.Filter):
@@ -245,6 +298,7 @@ def configure_logging(
             console_handler._autoflow_managed = True
             console_handler._autoflow_target = "console"
             _add_common_filters(console_handler)
+            console_handler.addFilter(PerformanceFilter(False))
             handlers.append(console_handler)
 
             framework_runtime = _make_file_handler(
@@ -289,6 +343,7 @@ def configure_logging(
                 )
                 handlers.append(runtime_handler)
                 runtime_handler.addFilter(ProjectOnlyFilter(project))
+                runtime_handler.addFilter(PerformanceFilter(False))
                 error_handler = _make_file_handler(
                     base_path / project / "logs" / "error.log",
                     level=logging.ERROR,
@@ -302,6 +357,14 @@ def configure_logging(
                 project_logger.addHandler(console_handler)
                 project_logger.addHandler(runtime_handler)
                 project_logger.addHandler(error_handler)
+                if project == "video_filter":
+                    performance_handler = _make_file_handler(
+                        base_path / project / "logs" / "performance.log", level=logging.INFO,
+                        formatter=PerformanceFormatter(), max_bytes=max_bytes, backup_count=backup_count,
+                        target="video_filter/performance")
+                    performance_handler.addFilter(PerformanceFilter(True))
+                    handlers.append(performance_handler)
+                    project_logger.addHandler(performance_handler)
                 project_logger.setLevel(logging.INFO)
                 project_logger.propagate = False
         except Exception:

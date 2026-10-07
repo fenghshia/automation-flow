@@ -49,6 +49,44 @@ class ProcessTree:
             except ProcessLookupError:
                 pass
 
+    def identities(self):
+        """Only members of this owned job/process group; never inspect media."""
+        from .resources import process_identity
+        if self.closed:
+            return []
+        if self.handle:
+            import ctypes
+            from ctypes import wintypes as w
+            query = self.kernel.QueryInformationJobObject
+            query.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD)]
+            size = 4096
+            while True:
+                buffer = ctypes.create_string_buffer(size)
+                if query(self.handle, 3, buffer, size, None):
+                    count = ctypes.c_ulong.from_buffer(buffer, 4).value
+                    values = (ctypes.c_size_t * count).from_buffer(buffer, 8)
+                    pids = list(values)
+                    break
+                if ctypes.get_last_error() != 234 or size >= 65536:
+                    raise OSError("owned_process_identity_unavailable")
+                size *= 2
+        else:
+            from pathlib import Path
+            pids = []
+            for entry in Path("/proc").iterdir():
+                if entry.name.isdigit():
+                    try:
+                        if os.getpgid(int(entry.name)) == self.process.pid:
+                            pids.append(int(entry.name))
+                    except ProcessLookupError:
+                        pass
+        results = []
+        for pid in pids:
+            identity = process_identity(pid)
+            if identity:
+                results.append({"pid": pid, "identity": identity})
+        return results
+
     def close(self):
         if self.closed:
             return
