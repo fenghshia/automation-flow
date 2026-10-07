@@ -1,0 +1,5 @@
+.training-thresholds{border:1px solid var(--line);border-radius:8px;padding:12px;margin:0 0 12px;display:flex;flex-wrap:wrap;gap:12px}
+.training-thresholds label{display:flex;flex-direction:column;gap:5px;flex:1;min-width:180px}
+.training-thresholds input{font:inherit;padding:8px;border:1px solid var(--line);border-radius:6px;width:100%;background:var(--surface);color:var(--ink)}
+.training-thresholds input:focus-visible{outline:3px solid #66b69e;outline-offset:2px}
+.training-form p{margin-bottom:12px}

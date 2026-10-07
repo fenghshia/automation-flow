@@ -30,10 +30,13 @@ class VideoMAEAdapter:
         self.model.requires_grad_(False).eval().to(device)
 
     def extract(self, frames):
-        batch = self.processor(list(frames), return_tensors="pt", do_resize=False, do_center_crop=False)
+        return self.extract_batch([frames])[0]
+
+    def extract_batch(self, clips):
+        batch = self.processor([list(frames) for frames in clips], return_tensors="pt", do_resize=False, do_center_crop=False)
         with self.torch.inference_mode():
             hidden = self.model.videomae(batch["pixel_values"].to(self.device)).last_hidden_state
             features = hidden.mean(dim=1)
             if self.model.fc_norm is not None:
                 features = self.model.fc_norm(features)
-        return features[0].cpu().numpy().astype(np.float32)
+        return features.cpu().numpy().astype(np.float32)

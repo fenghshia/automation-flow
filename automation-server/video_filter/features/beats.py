@@ -34,11 +34,19 @@ class BeatsAdapter:
         self.torch, self.device = torch, device
 
     def extract(self, samples):
-        if len(samples) < 6400:
-            samples = np.pad(samples, (0, 6400 - len(samples)))
-        inputs = self.torch.from_numpy(samples).unsqueeze(0).to(self.device)
-        with self.torch.inference_mode():
-            features, _ = self.model.extract_features(inputs)
-        if features.ndim != 3 or features.shape[-1] != 768:
-            raise ValueError("BEATs returned probabilities rather than latent features.")
-        return features.mean(dim=1)[0].cpu().numpy().astype(np.float32)
+        return self.extract_batch([samples])[0]
+
+    def extract_batch(self, chunks):
+        # Equal-length groups avoid padding changing BEATs' per-clip fbank
+        # normalization/attention, and preserve the original short-tail features.
+        padded = [np.pad(chunk, (0, max(0, 6400 - len(chunk)))) for chunk in chunks]
+        result = np.empty((len(chunks), 768), dtype=np.float32)
+        for length in sorted({len(chunk) for chunk in padded}):
+            positions = [i for i, chunk in enumerate(padded) if len(chunk) == length]
+            inputs = self.torch.from_numpy(np.stack([padded[i] for i in positions])).to(self.device)
+            with self.torch.inference_mode():
+                features, _ = self.model.extract_features(inputs)
+                if features.ndim != 3 or features.shape[-1] != 768:
+                    raise ValueError("BEATs returned probabilities rather than latent features.")
+                result[positions] = features.mean(dim=1).cpu().numpy().astype(np.float32)
+        return result

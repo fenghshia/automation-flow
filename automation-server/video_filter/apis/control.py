@@ -134,11 +134,17 @@ def enqueue(kind):
     data = request.get_json(silent=True)
     if data is None:
         data = {}
-    allowed = {"model_type"} if kind == "train" else {"variant_id"}
+    allowed = {"model_type", "acceptance"} if kind == "train" else {"variant_id"}
     if not isinstance(data, dict) or set(data) - allowed:
         return jsonify(error_code="invalid_request"), 400
     if kind == "train" and "model_type" in data and data["model_type"] not in ("logistic_regression", "mil"):
         return jsonify(error_code="invalid_classifier_type"), 400
+    if kind == "train" and "acceptance" in data:
+        from video_filter.training_config import validate_acceptance
+        try:
+            validate_acceptance(data["acceptance"])
+        except ValueError:
+            return jsonify(error_code="invalid_training_acceptance"), 400
     if kind in ("extract", "predict", "classify"):
         from uuid import UUID
 
@@ -150,13 +156,16 @@ def enqueue(kind):
             return jsonify(error_code="canonical_variant_id_required"), 400
     try:
         if kind == "train":
-            task = submit(db.session, _settings(), kind, model_type=data.get("model_type"))
+            options = {"acceptance": data["acceptance"]} if "acceptance" in data else {}
+            task = submit(db.session, _settings(), kind, model_type=data.get("model_type"), **options)
         else:
             task = submit(db.session, _settings(), kind, data.get("variant_id"))
         return jsonify(task_id=task.id, status=task.status), 202
     except Exception as error:
         if isinstance(error, ValueError) and str(error) == "insufficient_confirmed_samples_minimum_10_per_class":
             logger.info("训练请求暂缓：每类有效样本需至少 10 个")
+        elif isinstance(error, ValueError) and str(error) == "lineage_reconciliation_pending":
+            logger.info("任务入队请求暂缓：文件搬运或压缩记录尚待扫描对账 | kind=%s", kind)
         else:
             log_failure(logger, "任务入队请求失败 | kind=%s", error, kind)
         db.session.rollback()

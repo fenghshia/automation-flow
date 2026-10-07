@@ -115,7 +115,7 @@ class ImageCompressionService:
         self.source_directory = Path(source_directory).resolve()
         self.output_directory = Path(output_directory).resolve()
         self.pending_root = Path(
-            pending_root or Path(__file__).with_name("pending")
+            reject_links(pending_root or Path(__file__).with_name("pending"))
         ).resolve()
         self.archive_extractor = archive_extractor or ArchiveExtractor(
             seven_zip_bin_directory
@@ -466,6 +466,8 @@ class ImageCompressionService:
         total_files = len(leaves)
         prepared_leaves = []
         for index, leaf in enumerate(leaves, start=1):
+            self.report_progress("inspecting", current_file=leaf.provenance,
+                                 completed_files=0, total_files=total_files)
             try:
                 inspection = self.image_processor.probe(leaf.path)
             except Exception as error:
@@ -485,15 +487,20 @@ class ImageCompressionService:
                     source_name=leaf.path.name,
                     planned_basename=self._planned_basename(leaf.path, inspection),
                     inspection=inspection,
+                    directories=leaf.directories,
                 )
             )
 
-        names = allocate_names(
-            [
+        if self.flatten:
+            names = allocate_names([
                 NameCandidate(leaf.key, leaf.provenance, leaf.planned_basename)
                 for leaf in prepared_leaves
-            ]
-        )
+            ])
+        else:
+            names = allocate_tree_paths([
+                TreeCandidate(leaf.key, leaf.provenance, leaf.planned_basename, leaf.directories)
+                for leaf in prepared_leaves
+            ])
         result_path = mission_directory / "result"
         result_path.mkdir()
         logger.info(
@@ -507,6 +514,14 @@ class ImageCompressionService:
         for index, leaf in enumerate(prepared_leaves, start=1):
             destination_name = names[leaf.key]
             destination = result_path / destination_name
+            reject_links(destination)
+            if not destination.resolve().is_relative_to(result_path.resolve()):
+                raise ImagePipelineError("Result path is outside its owned directory")
+            final_candidate = self.output_directory / destination_key / destination_name
+            if os.name == "nt" and max(len(str(destination)), len(str(final_candidate))) >= 260:
+                raise ImagePipelineError("Image output path exceeds the supported Windows length")
+            self.report_progress("processing", current_file=leaf.provenance,
+                                 completed_files=index - 1, total_files=total_files)
             source_size = leaf.path.stat().st_size
             image_format, dimensions, pixel_count, original_suffix = (
                 self._inspection_values(leaf.inspection)
@@ -588,6 +603,8 @@ class ImageCompressionService:
                     provenance=leaf.provenance,
                     output_path=destination,
                 ) from error
+            self.report_progress("processing", current_file=leaf.provenance,
+                                 completed_files=index, total_files=total_files)
             action = (
                 "compressed"
                 if compressed
@@ -634,7 +651,7 @@ class ImageCompressionService:
         if manifest.file_count != len(prepared_leaves):
             raise ImagePipelineError("Result file count does not match the source batch")
         resolved_destination_key = (
-            names[prepared_leaves[0].key]
+            Path(names[prepared_leaves[0].key]).name
             if source_kind == "file"
             else destination_key
         )
@@ -650,6 +667,7 @@ class ImageCompressionService:
         return PreparedBatch(result_path, destination, is_directory, manifest)
 
     def stage_for_publish(self, mission_id, prepared):
+        self.report_progress("staging", current_file=None)
         staging = self.publish_staging_path(mission_id)
         destination = self._direct_child(
             prepared.destination, self.output_directory, "Output path"

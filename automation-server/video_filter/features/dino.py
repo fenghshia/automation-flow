@@ -21,15 +21,14 @@ class DinoAdapter:
         self.std = torch.tensor(config["std"], device=device).view(1, 3, 1, 1)
 
     def extract(self, frames):
+        from .batching import infer_batches
+
+        return infer_batches(self, frames, len(frames), modality="dino").mean(0)
+
+    def extract_batch(self, frames):
         torch = self.torch
-        inputs = torch.from_numpy(frames).permute(0, 3, 1, 2).to(self.device, torch.float32) / 255
+        inputs = torch.from_numpy(np.asarray(frames)).permute(0, 3, 1, 2).to(self.device, torch.float32) / 255
         with torch.inference_mode():
             normalized = (inputs - self.mean) / self.std
-            try:
-                features = self.model.forward_features(normalized)[:, 0]
-            except torch.cuda.OutOfMemoryError:
-                if len(frames) <= 1:
-                    raise
-                torch.cuda.empty_cache()
-                features = torch.cat([self.model.forward_features(frame.unsqueeze(0))[:, 0] for frame in normalized])
-        return features.mean(0).cpu().numpy().astype(np.float32)
+            features = self.model.forward_features(normalized)[:, 0]
+        return features.cpu().numpy().astype(np.float32)
