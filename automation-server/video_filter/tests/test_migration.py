@@ -12,6 +12,24 @@ from app import db
 
 
 class MigrationTests(DatabaseTestCase):
+    def test_memory_upgrade_preserves_leases_and_live_downgrade_is_blocked(self):
+        migration = self.migration("d2e90b1746a3_add_gpu_memory_budgets.py")
+        engine = create_engine("sqlite://")
+        try:
+            with engine.begin() as connection:
+                connection.exec_driver_sql("CREATE TABLE media_resource_lease (id TEXT PRIMARY KEY, status TEXT, evidence TEXT)")
+                connection.exec_driver_sql("INSERT INTO media_resource_lease VALUES ('fixture', 'active', 'preserve')")
+                with patch.object(migration, "op", Operations(MigrationContext.configure(connection))):
+                    migration.upgrade()
+                    self.assertEqual(("fixture", "active", "preserve", None, "{}"), tuple(connection.exec_driver_sql("SELECT * FROM media_resource_lease").one()))
+                    with self.assertRaisesRegex(RuntimeError, "Finish active GPU workers"):
+                        migration.downgrade()
+                    connection.exec_driver_sql("UPDATE media_resource_lease SET status='released'")
+                    migration.downgrade()
+                    self.assertEqual(("fixture", "released", "preserve"), tuple(connection.exec_driver_sql("SELECT * FROM media_resource_lease").one()))
+        finally:
+            engine.dispose()
+
     def migration(self, filename):
         path = Path(__file__).parents[2] / "migrations" / "versions" / filename
         spec = importlib.util.spec_from_file_location("video_filter_test_migration", path)
@@ -28,7 +46,8 @@ class MigrationTests(DatabaseTestCase):
         )]
 
     def test_isolated_upgrade_matches_models_and_downgrade_preserves_other_tables(self):
-        migrations = self.chain() + [self.migration("c4f18a2d9076_group_video_filter_and_resources.py")]
+        migrations = self.chain() + [self.migration("c4f18a2d9076_group_video_filter_and_resources.py"),
+            self.migration("d2e90b1746a3_add_gpu_memory_budgets.py")]
         engine = create_engine("sqlite://")
         try:
             with engine.begin() as connection:

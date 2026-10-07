@@ -90,6 +90,26 @@ class WorkflowTests(DatabaseTestCase):
         self.scan(9)
         self.assertEqual(1, db.session.get(Asset, asset.id).label)
 
+    def test_vanishing_file_during_hash_defers_scan_without_premature_negative_feedback(self):
+        path, asset, variant = self.register_file()
+        bundle = self.save_bundle(asset, variant)
+        # A changed source requires hashing on the next scan.
+        path.write_bytes(b"changed-synthetic-video")
+        self.scan(3)
+        def vanished(*args):
+            path.unlink()
+            raise FileNotFoundError("synthetic video disappeared")
+        with patch("video_filter.tracking.hash_stable", side_effect=vanished), \
+                patch("video_filter.tracking.log_exception") as failures:
+            self.assertFalse(self.scan(5).complete)
+        failures.assert_not_called()
+        self.assertEqual(1, db.session.get(Asset, asset.id).label)
+        FeatureStore().require_ready(db.session, bundle.bundle_id)
+        self.scan(6)
+        self.assertEqual(1, db.session.get(Asset, asset.id).label)
+        self.scan(9)
+        self.assertEqual(0, db.session.get(Asset, asset.id).label)
+
     def test_incomplete_scan_and_configuration_change_do_not_reject(self):
         path, asset, _ = self.register_file()
         path.unlink()
@@ -140,14 +160,17 @@ class WorkflowTests(DatabaseTestCase):
             self.save_bundle(asset, variant, float(index % 2) * 2 - 1)
         return train(db.session, signature().digest)
 
-    def test_training_activation_and_feedback_retirement(self):
+    def test_training_activation_and_feedback_keeps_model_serving(self):
         model = self.trained_model()
         self.assertEqual("active", model.status)
         self.assertEqual(20, len(model.dataset_snapshot))
         asset = db.session.get(Asset, model.dataset_snapshot[0]["asset_id"])
         FeedbackJournal(self.settings["state_directory"]).submit(db.session,
             feedback_values(asset, 1 - asset.label, {"reason": "user_confirmed"}))
-        self.assertIsNone(db.session.get(ModelRun, model.id).active_slot)
+        current = db.session.get(ModelRun, model.id)
+        self.assertEqual("active", current.active_slot)
+        self.assertEqual("active", current.status)
+        self.assertTrue(current.validation["needs_update"])
 
     def transfer_task(self):
         path, asset, variant = self.register_file("unclassified")
@@ -180,6 +203,40 @@ class WorkflowTests(DatabaseTestCase):
             classify(db.session, self.settings, task)
         self.assertTrue(path.exists())
         self.assertEqual(0, db.session.query(TransferOperation).count())
+
+    def test_feedback_arriving_during_copy_preserves_verified_stage_and_resumes(self):
+        from video_filter import transfer
+        path, _, _, task = self.transfer_task()
+        unrelated = Asset()
+        db.session.add(unrelated)
+        db.session.commit()
+        journal = FeedbackJournal(self.settings["state_directory"])
+        original_copy = transfer.shutil.copyfileobj
+        def copy_then_feedback(*args, **kwargs):
+            original_copy(*args, **kwargs)
+            journal.write(feedback_values(unrelated, 1, {"reason": "user_confirmed"}))
+        with patch.object(transfer.shutil, "copyfileobj", side_effect=copy_then_feedback):
+            with self.assertRaisesRegex(ValueError, "unresolved_feedback_journal"):
+                classify(db.session, self.settings, task)
+        db.session.rollback()
+        operation = db.session.execute(select(TransferOperation)).scalar_one()
+        self.assertEqual("destination_verified", operation.status)
+        self.assertIn("witness_snapshot", operation.evidence)
+        self.assertTrue(path.exists())
+        self.assertFalse(Path(operation.destination_path).exists())
+        from video_filter.runtime import process_round
+        with patch.object(FeedbackJournal, "replay", return_value={"applied": 0, "conflicts": 0, "superseded": 0}), \
+                patch("video_filter.tracking.reconcile"), patch("video_filter.runtime.claim_task", return_value=None), \
+                patch("video_filter.runtime.enqueue_automatic"), patch("video_filter.runtime.log_exception") as failures:
+            process_round(db.session, self.settings)
+        failures.assert_not_called()
+        db.session.refresh(operation)
+        self.assertEqual("destination_verified", operation.status)
+        self.assertTrue(path.exists())
+        self.assertEqual(1, journal.replay(db.session)["applied"])
+        operation = classify(db.session, self.settings, task)
+        self.assertEqual("source_cleaned", operation.status)
+        self.assertFalse(path.exists())
 
     def test_source_replacement_after_publication_is_preserved(self):
         path, _, _, task = self.transfer_task()
