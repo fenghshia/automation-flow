@@ -26,11 +26,18 @@ from ..policy import (
     is_archive_name,
 )
 from ..service import ImageCompressionService, ImagePipelineError
+from ..group_config import directory_key, mission_matches
+from ..progress import ProgressReporter
 
 
 IMAGE_COMPRESSION_ADVISORY_LOCK_ID = 0x494D47434D505245
 STABILITY_INTERVAL_SECONDS = 30
 logger = logging.getLogger(__name__)
+ACTIVE_STATUSES = {
+    ImageCompressionStatus.MOVING, ImageCompressionStatus.PROCESSING,
+    ImageCompressionStatus.PUBLISHING, ImageCompressionStatus.CLEANUP_PENDING,
+}
+_group_cursor = 0
 
 
 class DestinationConflictError(ImagePipelineError):
@@ -67,12 +74,63 @@ def image_compression_lock(engine):
                 )
 
 
-def build_service():
+def build_service(group=None):
+    if group is None:
+        group = EnvConfig.image_compression_settings()["groups"][0]
     return ImageCompressionService(
-        EnvConfig.image_compression_source_directory(),
-        EnvConfig.image_compression_output_directory(),
+        group["source_directory"],
+        group["output_directory"],
         EnvConfig.image_compression_7zip_bin_directory(),
+        flatten=group["flatten"],
     )
+
+
+def _scoped_query(group=None):
+    query = ImageCompressionMission.query
+    if group is not None:
+        query = query.filter_by(
+            group_name=group["name"], source_directory=str(group["source_directory"]),
+            output_directory=str(group["output_directory"]),
+            output_scope_key=group["output_scope_key"], flatten=group["flatten"],
+        )
+    return query
+
+
+def _destination_conflict(normalized, scope_key=None, *, mission_id=None, source_path=None):
+    query = ImageCompressionMission.query.filter(
+        ImageCompressionMission.destination_key_normalized == normalized,
+        ImageCompressionMission.status != ImageCompressionStatus.FAILED,
+    )
+    if mission_id is not None:
+        query = query.filter(ImageCompressionMission.id != mission_id)
+    if source_path is not None:
+        query = query.filter(ImageCompressionMission.source_path != source_path)
+    if scope_key is None:
+        return query.first()
+    bound = query.filter(ImageCompressionMission.output_scope_key == scope_key).first()
+    if bound is not None:
+        return bound
+    for historical in query.filter(ImageCompressionMission.output_scope_key.is_(None)).all():
+        if historical.output_path and directory_key(Path(historical.output_path).parent) == scope_key:
+            return historical
+    return None
+
+
+def bind_legacy_with_recorded_output(group):
+    """Only bind rows whose recorded output supplies the missing historical scope."""
+    if group["name"] != "legacy":
+        return
+    for mission in ImageCompressionMission.query.filter_by(group_name=None).all():
+        if (not mission.output_path
+                or directory_key(Path(mission.source_path).parent) != directory_key(group["source_directory"])
+                or directory_key(Path(mission.output_path).parent) != group["output_scope_key"]):
+            continue
+        ImageCompressionMission.query.filter_by(id=mission.id, group_name=None).update({
+            "group_name": group["name"], "source_directory": str(group["source_directory"]),
+            "output_directory": str(group["output_directory"]),
+            "output_scope_key": group["output_scope_key"], "flatten": True,
+        }, synchronize_session=False)
+        db.session.commit()
 
 
 def _source_kind(path):
@@ -106,7 +164,7 @@ def _snapshot_values(snapshot):
     }
 
 
-def register_next_source(source_directory, output_directory=None):
+def register_next_source(source_directory, output_directory=None, group=None):
     for path in discover_source_items(source_directory):
         source_path = str(path)
         if ImageCompressionMission.query.filter_by(source_path=source_path).first():
@@ -134,12 +192,10 @@ def register_next_source(source_directory, output_directory=None):
             output_directory
             and (Path(output_directory) / destination_key).exists()
         )
-        conflicting = ImageCompressionMission.query.filter(
-            ImageCompressionMission.destination_key_normalized
-            == normalized_destination,
-            ImageCompressionMission.source_path != source_path,
-            ImageCompressionMission.status != ImageCompressionStatus.FAILED,
-        ).first()
+        conflicting = _destination_conflict(
+            normalized_destination, directory_key(output_directory) if output_directory else None,
+            source_path=source_path,
+        )
         values = {
             "source_path": source_path,
             "source_kind": kind,
@@ -173,6 +229,11 @@ def register_next_source(source_directory, output_directory=None):
             "last_checked_at": datetime.utcnow(),
             **_snapshot_values(snapshot),
         }
+        if group is not None:
+            values.update(group_name=group["name"],
+                          source_directory=str(group["source_directory"]),
+                          output_directory=str(group["output_directory"]),
+                          output_scope_key=group["output_scope_key"], flatten=group["flatten"])
         statement = (
             insert(ImageCompressionMission)
             .values(**values)
@@ -207,10 +268,10 @@ def _snapshot_matches(mission, snapshot):
     )
 
 
-def refresh_waiting_mission(now=None):
+def refresh_waiting_mission(now=None, group=None):
     now = now or datetime.utcnow()
     mission = (
-        ImageCompressionMission.query.filter_by(
+        _scoped_query(group).filter_by(
             status=ImageCompressionStatus.WAITING_STABLE
         )
         .order_by(ImageCompressionMission.last_checked_at, ImageCompressionMission.id)
@@ -277,13 +338,15 @@ def refresh_waiting_mission(now=None):
     return mission
 
 
-def claim_ready_mission():
+def claim_ready_mission(group=None):
     candidate = (
-        ImageCompressionMission.query.filter_by(status=ImageCompressionStatus.READY)
+        _scoped_query(group).filter_by(status=ImageCompressionStatus.READY)
         .order_by(ImageCompressionMission.id)
         .first()
     )
     if candidate is None:
+        return None
+    if group is not None and not mission_matches(candidate, group):
         return None
     claimed = (
         db.session.query(ImageCompressionMission)
@@ -339,20 +402,15 @@ def _retry_assets_are_safe(service, mission):
 
 
 def _retry_destination_is_reserved(mission):
-    return (
-        ImageCompressionMission.query.filter(
-            ImageCompressionMission.id != mission.id,
-            ImageCompressionMission.destination_key_normalized
-            == mission.destination_key_normalized,
-            ImageCompressionMission.status != ImageCompressionStatus.FAILED,
-        ).first()
-        is not None
-    )
+    return _destination_conflict(
+        mission.destination_key_normalized, getattr(mission, "output_scope_key", None),
+        mission_id=mission.id,
+    ) is not None
 
 
-def claim_retryable_failure(service):
+def claim_retryable_failure(service, group=None):
     candidates = (
-        ImageCompressionMission.query.filter(
+        _scoped_query(group).filter(
             ImageCompressionMission.status == ImageCompressionStatus.FAILED,
             ImageCompressionMission.error_code.is_(None),
             or_(
@@ -374,6 +432,8 @@ def claim_retryable_failure(service):
         .all()
     )
     for candidate in candidates:
+        if group is not None and not mission_matches(candidate, group):
+            continue
         if _retry_destination_is_reserved(candidate):
             logger.warning(
                 "图片历史失败任务的输出名称已被其他任务占用 | mission_id=%s",
@@ -440,12 +500,10 @@ def _apply_prepared_destination(mission, prepared):
     destination_key = prepared.destination.name
     normalized_destination = collision_key(destination_key)
     if normalized_destination != mission.destination_key_normalized:
-        conflicting = ImageCompressionMission.query.filter(
-            ImageCompressionMission.id != mission.id,
-            ImageCompressionMission.destination_key_normalized
-            == normalized_destination,
-            ImageCompressionMission.status != ImageCompressionStatus.FAILED,
-        ).first()
+        conflicting = _destination_conflict(
+            normalized_destination, getattr(mission, "output_scope_key", None),
+            mission_id=mission.id,
+        )
         if conflicting is not None:
             raise DestinationConflictError(
                 f"Normalized output name is reserved by mission {conflicting.id}: "
